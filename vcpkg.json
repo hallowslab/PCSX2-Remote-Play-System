@@ -1,0 +1,8 @@
+{
+  "name": "pcsx2-remote-play",
+  "version": "0.1.0",
+  "dependencies": [
+    "sdl3",
+    "ffmpeg"
+  ]
+}
