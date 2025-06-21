@@ -92,6 +92,7 @@ bool init_encoder(const EncoderSettings& settings, EncoderContext& ctx) {
         ctx.codec = avcodec_find_encoder_by_name(codec_name);
     else
         ctx.codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    std::cout << "[Encoder] Using encoder: " << ctx.codec->name << "\n";
 
     if (!ctx.codec) {
         std::cerr << "[Encoder] Failed to find encoder\n";
@@ -113,7 +114,28 @@ bool init_encoder(const EncoderSettings& settings, EncoderContext& ctx) {
     ctx.codec_ctx->max_b_frames = 1;
     ctx.codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
 
-    // Set encoder options per codec_name, as before...
+    if (codec_name == "h264_nvenc") {
+        av_opt_set(ctx.codec_ctx->priv_data, "preset", "p7", 0);            // slowest (best quality)
+        av_opt_set(ctx.codec_ctx->priv_data, "tune", "lossless", 0);        // Lossless
+        av_opt_set(ctx.codec_ctx->priv_data, "delay", "0", 0);              // Delay frame output by the given amount of frames (from 0 to INT_MAX)
+        av_opt_set(ctx.codec_ctx->priv_data, "rc", "cbr", 0);               // Constant bitrate mode
+        av_opt_set(ctx.codec_ctx->priv_data, "zerolatency", "1", 0);        // Set 1 to indicate zero latency operation (no reordering delay)
+        av_opt_set(ctx.codec_ctx->priv_data, "gpu", "0", 0);                // first GPU (optional)
+        av_opt_set(ctx.codec_ctx->priv_data, "rc-lookahead", "0", 0);       // reduce latency by disabling lookahead
+        av_opt_set(ctx.codec_ctx->priv_data, "bufsize", "24000000", 0);     // buffer size matching bitrate (optional)
+    }
+    else if (codec_name == "h264_qsv") {
+        av_opt_set(ctx.codec_ctx->priv_data, "preset", "fast", 0);
+        av_opt_set(ctx.codec_ctx->priv_data, "async_depth", "1", 0);
+    }
+    else if (codec_name == "h264_amf") {
+        av_opt_set(ctx.codec_ctx->priv_data, "usage", "realtime", 0);
+        av_opt_set(ctx.codec_ctx->priv_data, "profile", "main", 0);
+    }
+    else if (codec_name == "libx264") {
+        av_opt_set(ctx.codec_ctx->priv_data, "preset", "ultrafast", 0);
+        av_opt_set(ctx.codec_ctx->priv_data, "tune", "zerolatency", 0);
+    }
 
     if (avcodec_open2(ctx.codec_ctx, ctx.codec, nullptr) < 0) {
         std::cerr << "[Encoder] Failed to open codec\n";
