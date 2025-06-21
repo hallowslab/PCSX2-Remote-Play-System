@@ -20,6 +20,9 @@ find_library(AVFORMAT_LIB avformat REQUIRED)
 find_library(SWSCALE_LIB swscale REQUIRED)
 find_library(AVUTIL_LIB avutil REQUIRED)
 
+include_directories(${CMAKE_SOURCE_DIR}/include)
+
+
 # Add your executable here FIRST
 add_executable(remote-play
     src/main.cpp
