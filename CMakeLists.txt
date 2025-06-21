@@ -27,6 +27,7 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 add_executable(remote-play
     src/main.cpp
     src/host/host.cpp
+    src/host/encoder/encoder.cpp
     src/client/client.cpp
 )
 

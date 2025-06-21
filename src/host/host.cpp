@@ -14,6 +14,8 @@ using Microsoft::WRL::ComPtr;
 #include <unistd.h>
 #endif
 
+#include "encoder/encoder.h"
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
@@ -61,11 +63,22 @@ bool init_dxgi_capture(ComPtr<ID3D11Device>& device, ComPtr<ID3D11DeviceContext>
     return true;
 }
 
+int send_all(int sock, const char* data, int len) {
+    int total_sent = 0;
+    while (total_sent < len) {
+        int sent = send(sock, data + total_sent, len - total_sent, 0);
+        if (sent <= 0) return sent;
+        total_sent += sent;
+    }
+    return total_sent;
+}
+
 void start_host_server(int port, bool& running) {
     #ifdef _WIN32
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-#endif
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+    #endif
+
 
     #ifdef _WIN32
         SOCKET server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -116,18 +129,20 @@ void start_host_server(int port, bool& running) {
     desc.MiscFlags = 0;
     device->CreateTexture2D(&desc, nullptr, &stagingTex);
 
-    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-    AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
-    codec_ctx->bit_rate = 400000;
-    codec_ctx->width = width;
-    codec_ctx->height = height;
-    codec_ctx->time_base = { 1, 30 };
-    codec_ctx->framerate = { 30, 1 };
-    codec_ctx->gop_size = 10;
-    codec_ctx->max_b_frames = 1;
-    codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    av_opt_set(codec_ctx->priv_data, "preset", "ultrafast", 0);
-    avcodec_open2(codec_ctx, codec, nullptr);
+    EncoderSettings settings = {
+        width,              // int
+        height,             // int
+        30,                 // fps
+        5'000'000,          // bitrate
+        EncoderType::NVENC, // preferred encoder
+        AV_PIX_FMT_BGRA     // input pixel format
+    };
+
+    EncoderContext enc;
+    if (!init_encoder(settings, enc)) {
+        std::cerr << "Failed to initialize encoder\n";
+        return;
+    }
 
     SwsContext* sws_ctx = sws_getContext(width, height, AV_PIX_FMT_BGRA,
         width, height, AV_PIX_FMT_YUV420P, 0, 0, 0, 0);
@@ -159,17 +174,22 @@ void start_host_server(int port, bool& running) {
         uint8_t* inData[1] = { (uint8_t*)mapped.pData };
         int inLinesize[1] = { (int)mapped.RowPitch };
 
-        sws_scale(sws_ctx, inData, inLinesize, 0, height, frame->data, frame->linesize);
-
-        frame->pts = frame_index++;
-
-        avcodec_send_frame(codec_ctx, frame);
+        sws_scale(enc.sws_ctx, inData, inLinesize, 0, enc.codec_ctx->height, enc.frame->data, enc.frame->linesize);
+        enc.frame->pts = frame_index++;
+        avcodec_send_frame(enc.codec_ctx, enc.frame);
         
-        while (avcodec_receive_packet(codec_ctx, pkt) == 0) {
-            int size = pkt->size;
-            send(client_fd, (char*)&size, sizeof(int), 0);
-            send(client_fd, (char*)pkt->data, size, 0);
-            av_packet_unref(pkt);
+        while (avcodec_receive_packet(enc.codec_ctx, enc.pkt) == 0) {
+            int net_size = enc.pkt->size;
+            int net_size_be = htonl(net_size);
+            if (send_all(client_fd, (char*)&net_size_be, sizeof(net_size_be)) != sizeof(net_size_be)) {
+                std::cerr << "[Host] Failed to send packet size\n";
+                break;
+            }
+            if (send_all(client_fd, (char*)enc.pkt->data, net_size) != net_size) {
+                std::cerr << "[Host] Failed to send packet data\n";
+                break;
+            }
+            av_packet_unref(enc.pkt);
         }
 
         context->Unmap(stagingTex.Get(), 0);
@@ -177,10 +197,7 @@ void start_host_server(int port, bool& running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(33));
     }
 
-    avcodec_free_context(&codec_ctx);
-    av_frame_free(&frame);
-    av_packet_free(&pkt);
-    sws_freeContext(sws_ctx);
+    destroy_encoder(enc);
 
 #ifdef _WIN32
     closesocket(client_fd);
