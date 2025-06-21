@@ -34,7 +34,7 @@ To build a **local remote play system** for **PCSX2 (PlayStation 2 emulator)** t
 ## 🏗️ Software Architecture
 
 ### 🧱 Modular Component Design
-
+```
 /remote-play-system
 ├── host/
 │ ├── capture/ # Video/audio capture modules
@@ -49,7 +49,7 @@ To build a **local remote play system** for **PCSX2 (PlayStation 2 emulator)** t
 ├── shared/
 │ ├── protocol/ # Networking protocol definitions
 │ └── networking/ # TCP/UDP/WebRTC communication
-
+```
 ---
 
 ## 🧰 Technology Stack
