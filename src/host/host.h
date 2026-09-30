@@ -1,13 +1,8 @@
 #pragma once
 
-#ifdef _WIN32
-#include <d3d11.h>
-#include <dxgi1_2.h>
-#include <wrl/client.h>
-using Microsoft::WRL::ComPtr;
-#pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "dxgi.lib")
-#endif
+namespace rps {
 
-void start_host_server(int port, bool& running);
+// Start the host server on the specified port
+void start_host_server(int port, bool &running, bool debug_audio = false);
 
+} // namespace rps

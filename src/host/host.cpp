@@ -1,210 +1,367 @@
 #include "host.h"
-#include <iostream>
-#include <thread>
-
-#ifdef _WIN32
-#include <d3d11.h>
-#include <dxgi1_2.h>
-#include <wrl/client.h>
-using Microsoft::WRL::ComPtr;
-#else
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#endif
-
+#include "../shared/protocol/protocol.h"
+#include "../shared/keys.h"
+#include "capture/audio_capture.h"
+#include "capture/capture.h"
+#include "capture/dxgi_capture.h"
 #include "encoder/encoder.h"
+#include "input/input_injector.h"
+#include "input/input_mapper.h"
+
+#include <atomic>
+#include <chrono>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
-#include <libswscale/swscale.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libswscale/swscale.h>
 }
 
-bool init_dxgi_capture(ComPtr<ID3D11Device>& device, ComPtr<ID3D11DeviceContext>& context,
-    ComPtr<IDXGIOutputDuplication>& duplication, int& width, int& height) {
-    HRESULT hr;
-    ComPtr<IDXGIFactory1> dxgiFactory;
-    hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&dxgiFactory);
-    if (FAILED(hr)) return false;
+#include <enet/enet.h>
 
-    ComPtr<IDXGIAdapter1> adapter;
-    hr = dxgiFactory->EnumAdapters1(0, &adapter);
-    if (FAILED(hr)) return false;
+#include <cstdio>
 
-    ComPtr<IDXGIOutput> output;
-    hr = adapter->EnumOutputs(0, &output);
-    if (FAILED(hr)) return false;
+namespace rps {
 
-    DXGI_OUTPUT_DESC desc;
-    output->GetDesc(&desc);
+void start_host_server(int port, bool &running, bool debug_audio) {
+  if (enet_initialize() != 0) {
+    std::cerr << "[Host] Failed to initialize ENet\n";
+    return;
+  }
 
-    ComPtr<IDXGIOutput1> output1;
-    hr = output.As(&output1);
-    if (FAILED(hr)) return false;
+  FILE *audio_dump = nullptr;
+  if (debug_audio) {
+    audio_dump = fopen("host_capture_debug.raw", "wb");
+    std::cout
+        << "[Host] Debug audio recording enabled: host_capture_debug.raw\n";
+  }
 
-    D3D_FEATURE_LEVEL level;
-    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-        nullptr, 0, D3D11_SDK_VERSION, &device, &level, &context);
-    if (FAILED(hr)) return false;
+  ENetAddress address;
+  address.host = ENET_HOST_ANY;
+  address.port = static_cast<enet_uint16>(port);
 
-    ComPtr<IDXGIDevice> dxgiDevice;
-    device.As(&dxgiDevice);
+  // Create host with 1 client connection, 3 channels (0: reliable control, 1:
+  // video, 2: audio)
+  ENetHost *server = enet_host_create(&address, 1, 3, 0, 0);
+  if (server == nullptr) {
+    std::cerr << "[Host] Failed to create ENet server\n";
+    enet_deinitialize();
+    return;
+  }
 
-    ComPtr<IDXGIAdapter> dxgiAdapter;
-    dxgiDevice->GetAdapter(&dxgiAdapter);
+  std::cout << "[Host] Waiting for client on UDP port " << port << "...\n";
 
-    hr = output1->DuplicateOutput(device.Get(), &duplication);
-    if (FAILED(hr)) return false;
+  auto capture = createCapture();
+  CaptureConfig capture_config;
+  if (!capture->init(capture_config)) {
+    std::cerr << "[Host] Failed to initialize capture\n";
+    enet_host_destroy(server);
+    enet_deinitialize();
+    return;
+  }
 
-    width = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
-    height = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
-    return true;
-}
+  int width, height;
+  capture->getDimensions(width, height);
+  std::cout << "[Host] Capture dimensions: " << width << "x" << height << "\n";
 
-int send_all(int sock, const char* data, int len) {
-    int total_sent = 0;
-    while (total_sent < len) {
-        int sent = send(sock, data + total_sent, len - total_sent, 0);
-        if (sent <= 0) return sent;
-        total_sent += sent;
+  EncoderSettings enc_settings;
+  enc_settings.width = width;
+  enc_settings.height = height;
+  enc_settings.fps = 60;
+  enc_settings.bitrate = 8000000;
+  enc_settings.preferred = EncoderType::NVENC;
+  enc_settings.input_format = AV_PIX_FMT_BGR0; // DXGI standard
+  enc_settings.fps = 60;                       // Ensure FPS is explicitly 60
+
+  EncoderContext enc_ctx;
+  if (!init_encoder(enc_settings, enc_ctx)) {
+    std::cerr << "[Host] Failed to initialize video encoder\n";
+    enet_host_destroy(server);
+    enet_deinitialize();
+    return;
+  }
+
+  // --- Audio Setup ---
+  auto audio_capture = createAudioCapture();
+  AudioEncoderContext audio_enc_ctx;
+  AudioEncoderSettings audio_settings;
+  audio_settings.bitrate = 64000; // 64kbps is plenty for Opus and safer for UDP
+  bool audio_enabled = false;
+
+  if (audio_capture && audio_capture->init(AudioConfig())) {
+    if (init_audio_encoder(audio_settings, audio_enc_ctx)) {
+      std::cout
+          << "[Host] Audio capture and encoder initialized (Bitrate: 64kbps)\n";
+      audio_enabled = true;
+      audio_capture->start();
     }
-    return total_sent;
-}
+  }
 
-void start_host_server(int port, bool& running) {
-    #ifdef _WIN32
-        WSADATA wsa;
-        WSAStartup(MAKEWORD(2, 2), &wsa);
-    #endif
+  if (!capture->start()) {
+    std::cerr << "[Host] Failed to start video capture\n";
+    destroy_encoder(enc_ctx);
+    if (audio_enabled)
+      destroy_audio_encoder(audio_enc_ctx);
+    enet_host_destroy(server);
+    enet_deinitialize();
+    return;
+  }
 
+  std::atomic<ENetPeer *> client_peer{nullptr};
+  bool streaming = false;
 
-    #ifdef _WIN32
-        SOCKET server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    #else
-        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    #endif
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
+  // Encoded audio packets (header + payload) produced by the audio thread and
+  // drained by the main loop, so ENet stays single-threaded.
+  std::queue<std::vector<uint8_t>> audio_send_queue;
+  std::mutex audio_send_mtx;
 
-    bind(server_fd, (sockaddr*)&server_addr, sizeof(server_addr));
-    listen(server_fd, 1);
-    std::cout << "[Host] Waiting for client...\n";
+  // --- Input injection ---
+  auto injector = createInputInjector();
+  InputMapper mapper;
+  if (!injector || !injector->init()) {
+    std::cerr << "[Host] Failed to initialize input injector\n";
+  }
 
-    #ifdef _WIN32
-        SOCKET client_fd = accept(server_fd, nullptr, nullptr);
-    #else
-        int client_fd = accept(server_fd, nullptr, nullptr);
-        if (client_fd < 0) {
-            std::cerr << "Failed to accept client\n";
-            return;
-        }
-    #endif
-    std::cout << "[Host] Client connected!\n";
+  auto frame_duration = std::chrono::microseconds(1000000 / enc_settings.fps);
+  auto last_frame_time = std::chrono::steady_clock::now();
 
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> context;
-    ComPtr<IDXGIOutputDuplication> duplication;
-    int width = 0, height = 0;
-
-    if (!init_dxgi_capture(device, context, duplication, width, height)) {
-        std::cerr << "[Host] DXGI initialization failed\n";
-        return;
-    }
-
-    ComPtr<ID3D11Texture2D> stagingTex;
-    D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width = width;
-    desc.Height = height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    desc.BindFlags = 0;
-    desc.MiscFlags = 0;
-    device->CreateTexture2D(&desc, nullptr, &stagingTex);
-
-    EncoderSettings settings = {
-        width,              // int
-        height,             // int
-        30,                 // fps
-        5'000'000,          // bitrate
-        EncoderType::NVENC, // preferred encoder
-        AV_PIX_FMT_BGRA     // input pixel format
-    };
-
-    EncoderContext enc;
-    if (!init_encoder(settings, enc)) {
-        std::cerr << "Failed to initialize encoder\n";
-        return;
-    }
-
-    SwsContext* sws_ctx = sws_getContext(width, height, AV_PIX_FMT_BGRA,
-        width, height, AV_PIX_FMT_YUV420P, 0, 0, 0, 0);
-
-    AVFrame* frame = av_frame_alloc();
-    frame->format = AV_PIX_FMT_YUV420P;
-    frame->width = width;
-    frame->height = height;
-    av_frame_get_buffer(frame, 32);
-
-    AVPacket* pkt = av_packet_alloc();
-    
-    int64_t frame_index = 0;
-
-    while (running) {
-        DXGI_OUTDUPL_FRAME_INFO frameInfo;
-        ComPtr<IDXGIResource> desktopResource;
-        HRESULT hr = duplication->AcquireNextFrame(100, &frameInfo, &desktopResource);
-        if (FAILED(hr)) continue;
-
-        ComPtr<ID3D11Texture2D> tex;
-        desktopResource.As(&tex);
-
-        context->CopyResource(stagingTex.Get(), tex.Get());
-
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        context->Map(stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-
-        uint8_t* inData[1] = { (uint8_t*)mapped.pData };
-        int inLinesize[1] = { (int)mapped.RowPitch };
-
-        sws_scale(enc.sws_ctx, inData, inLinesize, 0, enc.codec_ctx->height, enc.frame->data, enc.frame->linesize);
-        enc.frame->pts = frame_index++;
-        avcodec_send_frame(enc.codec_ctx, enc.frame);
-        
-        while (avcodec_receive_packet(enc.codec_ctx, enc.pkt) == 0) {
-            int net_size = enc.pkt->size;
-            int net_size_be = htonl(net_size);
-            if (send_all(client_fd, (char*)&net_size_be, sizeof(net_size_be)) != sizeof(net_size_be)) {
-                std::cerr << "[Host] Failed to send packet size\n";
-                break;
-            }
-            if (send_all(client_fd, (char*)enc.pkt->data, net_size) != net_size) {
-                std::cerr << "[Host] Failed to send packet data\n";
-                break;
-            }
-            av_packet_unref(enc.pkt);
+  // Dedicated audio thread: capture + encode run independently of the video
+  // path so video encode spikes cannot starve audio capture (was causing
+  // stutter).
+  std::thread audio_worker;
+  if (audio_enabled) {
+    audio_worker = std::thread([&]() {
+      while (running) {
+        ENetPeer *peer = client_peer.load();
+        if (!peer) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          continue;
         }
 
-        context->Unmap(stagingTex.Get(), 0);
-        duplication->ReleaseFrame();
-        std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        AudioFrame audio_frame;
+        if (!audio_capture->acquireFrame(audio_frame)) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          continue;
+        }
+        if (audio_frame.samples.empty())
+          continue;
+
+        uint8_t *data_ptr = (uint8_t *)audio_frame.samples.data();
+        int nb_samples = (int)audio_frame.samples.size() / 2;
+
+        if (audio_dump) {
+          fwrite(audio_frame.samples.data(), sizeof(float),
+                 audio_frame.samples.size(), audio_dump);
+        }
+
+        static auto last_audit = std::chrono::steady_clock::now();
+        static int audit_samples = 0;
+        audit_samples += (int)audio_frame.samples.size() / 2;
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_audit)
+                .count() >= 1) {
+          std::cout << "[Host] Actual Audio Capture Rate: " << audit_samples
+                    << " Hz\n";
+          audit_samples = 0;
+          last_audit = now;
+        }
+
+        av_audio_fifo_write(audio_enc_ctx.fifo, (void **)&data_ptr,
+                            nb_samples);
+
+        while (av_audio_fifo_size(audio_enc_ctx.fifo) >=
+               audio_enc_ctx.codec_ctx->frame_size) {
+          av_audio_fifo_read(audio_enc_ctx.fifo,
+                             (void **)audio_enc_ctx.frame->data,
+                             audio_enc_ctx.codec_ctx->frame_size);
+
+          audio_enc_ctx.frame->pts = audio_enc_ctx.frame_index;
+          audio_enc_ctx.frame_index += audio_enc_ctx.frame->nb_samples;
+
+          if (avcodec_send_frame(audio_enc_ctx.codec_ctx,
+                                 audio_enc_ctx.frame) >= 0) {
+            while (avcodec_receive_packet(audio_enc_ctx.codec_ctx,
+                                          audio_enc_ctx.pkt) >= 0) {
+              static int audio_pkt_count = 0;
+              static uint16_t audio_seq_num = 0;
+
+              if (audio_pkt_count++ % 100 == 0) {
+                std::cout << "[Host] Sent 100 audio packets\n";
+              }
+
+              FrameHeader header;
+              header.type = (uint8_t)PacketType::AUDIO_FRAME;
+              header.flags = FLAG_NONE;
+              header.sequence_num = audio_seq_num++;
+              header.frame_id = audio_enc_ctx.frame_index;
+              header.timestamp_us = get_timestamp_us();
+              header.payload_size = (uint32_t)audio_enc_ctx.pkt->size;
+
+              std::vector<uint8_t> buf(sizeof(FrameHeader) +
+                                       audio_enc_ctx.pkt->size);
+              memcpy(buf.data(), &header, sizeof(FrameHeader));
+              memcpy(buf.data() + sizeof(FrameHeader), audio_enc_ctx.pkt->data,
+                     audio_enc_ctx.pkt->size);
+
+              {
+                std::lock_guard<std::mutex> lock(audio_send_mtx);
+                audio_send_queue.push(std::move(buf));
+              }
+
+              av_packet_unref(audio_enc_ctx.pkt);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  while (running) {
+    ENetEvent event;
+    while (enet_host_service(server, &event, 0) > 0) {
+      switch (event.type) {
+      case ENET_EVENT_TYPE_CONNECT:
+        std::cout << "[Host] Client connected from "
+                  << (event.peer->address.host & 0xFF) << "."
+                  << ((event.peer->address.host >> 8) & 0xFF) << "."
+                  << ((event.peer->address.host >> 16) & 0xFF) << "."
+                  << ((event.peer->address.host >> 24) & 0xFF) << ":"
+                  << event.peer->address.port << "\n";
+        client_peer.store(event.peer);
+        streaming = true;
+        break;
+
+      case ENET_EVENT_TYPE_RECEIVE: {
+        if (event.channelID == 0 &&
+            event.packet->dataLength >= sizeof(FrameHeader)) {
+          const FrameHeader *hdr =
+              reinterpret_cast<const FrameHeader *>(event.packet->data);
+          if (hdr->type == (uint8_t)PacketType::INPUT_EVENT &&
+              event.packet->dataLength >=
+                  sizeof(FrameHeader) + sizeof(InputPacket)) {
+            InputPacket ip;
+            memcpy(&ip, event.packet->data + sizeof(FrameHeader),
+                   sizeof(InputPacket));
+            if (injector && !injector->sendGamepadState(ip)) {
+              mapper.processGamepad(ip, [&](uint32_t vk, bool down) {
+                injector->sendKey(vk, down);
+              });
+            }
+          } else if (hdr->type == (uint8_t)PacketType::KEYBOARD_EVENT &&
+                     event.packet->dataLength >=
+                         sizeof(FrameHeader) + sizeof(KeyPacket)) {
+            KeyPacket kp;
+            memcpy(&kp, event.packet->data + sizeof(FrameHeader),
+                   sizeof(KeyPacket));
+            uint32_t vk = sdlk_to_vk((SDL_Keycode)kp.key);
+            if (injector && vk != 0)
+              injector->sendKey(vk, kp.down != 0);
+          }
+        }
+        enet_packet_destroy(event.packet);
+        break;
+      }
+
+      case ENET_EVENT_TYPE_DISCONNECT:
+        std::cout << "[Host] Client disconnected\n";
+        client_peer.store(nullptr);
+        streaming = false;
+        mapper.reset();
+        break;
+
+      default:
+        break;
+      }
     }
 
-    destroy_encoder(enc);
+    ENetPeer *peer = client_peer.load();
+    if (streaming && peer) {
+      // --- Audio send: drain queue produced by audio thread ---
+      {
+        std::lock_guard<std::mutex> lock(audio_send_mtx);
+        while (!audio_send_queue.empty()) {
+          std::vector<uint8_t> &buf = audio_send_queue.front();
+          ENetPacket *packet = enet_packet_create(
+              buf.data(), buf.size(), ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT);
+          enet_peer_send(peer, 2, packet);
+          audio_send_queue.pop();
+        }
+      }
 
-#ifdef _WIN32
-    closesocket(client_fd);
-    closesocket(server_fd);
-    WSACleanup();
-#else
-    close(client_fd);
-    close(server_fd);
-#endif
+      // --- Video Processing ---
+      auto now = std::chrono::steady_clock::now();
+      if (now - last_frame_time >= frame_duration) {
+        last_frame_time = now;
+
+        CapturedFrame frame;
+        if (capture->acquireFrame(frame, 0)) {
+          // Check for resolution change
+          if (frame.width != enc_settings.width ||
+              frame.height != enc_settings.height) {
+            std::cout << "[Host] Resolution changed to " << frame.width << "x"
+                      << frame.height << "\n";
+            destroy_encoder(enc_ctx);
+            enc_settings.width = frame.width;
+            enc_settings.height = frame.height;
+            if (!init_encoder(enc_settings, enc_ctx)) {
+              std::cerr << "[Host] Failed to reinit encoder\n";
+              running = false;
+              break;
+            }
+          }
+
+          // Convert and encode
+          const uint8_t *src_slices[] = {frame.data};
+          int src_stride[] = {frame.pitch};
+          sws_scale(enc_ctx.sws_ctx, src_slices, src_stride, 0, frame.height,
+                    enc_ctx.frame->data, enc_ctx.frame->linesize);
+
+          enc_ctx.frame->pts = enc_ctx.frame_index++;
+
+          if (avcodec_send_frame(enc_ctx.codec_ctx, enc_ctx.frame) >= 0) {
+            while (avcodec_receive_packet(enc_ctx.codec_ctx, enc_ctx.pkt) >=
+                   0) {
+              // Send packet via ENet
+              // Channel 1 for video (unreliable)
+              ENetPacket *packet =
+                  enet_packet_create(enc_ctx.pkt->data, enc_ctx.pkt->size,
+                                     ENET_PACKET_FLAG_UNRELIABLE_FRAGMENT);
+              enet_peer_send(peer, 1, packet);
+
+              av_packet_unref(enc_ctx.pkt);
+            }
+          }
+          capture->releaseFrame();
+        }
+      }
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    enet_host_flush(server);
+  }
+
+  std::cout << "[Host] Streaming stopped\n";
+  if (audio_worker.joinable())
+    audio_worker.join();
+  if (capture)
+    capture->stop();
+  if (audio_enabled) {
+    audio_capture->stop();
+    destroy_audio_encoder(audio_enc_ctx);
+  }
+  destroy_encoder(enc_ctx);
+  if (audio_dump)
+    fclose(audio_dump);
+  enet_host_destroy(server);
+  enet_deinitialize();
 }
+
+} // namespace rps

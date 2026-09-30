@@ -3,6 +3,21 @@
   "version": "0.1.0",
   "dependencies": [
     "sdl3",
-    {"name": "ffmpeg", "features": ["avcodec","avformat","swscale","amf","qsv","nvcodec"]}
+    {
+      "name": "ffmpeg",
+      "features": [
+        "avcodec",
+        "avformat",
+        "swscale",
+        "swresample",
+        "amf",
+        "qsv",
+        "nvcodec",
+        "x264",
+        "opus"
+      ]
+    },
+    "enet",
+    "opus"
   ]
 }
