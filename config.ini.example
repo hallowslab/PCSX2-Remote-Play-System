@@ -1,0 +1,24 @@
+# PCSX2 Remote Play — sample config.
+# Copy this file to `config.ini` next to remote-play.exe and edit the paths.
+
+# Emulator executables
+[pcsx2]
+path = C:\Emulators\PCSX2\pcsx2-qt.exe
+
+[rpcs3]
+path = C:\Emulators\RPCS3\rpcs3.exe
+
+[directories]
+# emulator | directory to scan
+#   Each subfolder of the directory is one game (name = folder name); a loose
+#   image file directly in the directory is also a game (name = file name).
+#   pcsx2 -> looks one level into each subfolder for .iso/.bin/.elf/.cue/.img
+#   rpcs3 -> looks for EBOOT.BIN (PS3_GAME/USRDIR, USRDIR, or root of the
+#            folder) or a loose .iso inside each subfolder
+pcsx2 | D:\Games\PS2
+rpcs3  | D:\Games\PS3\Disc
+rpcs3  | D:\Games\PS3\ISO
+
+# [games] — optional: individual games on top of the scanned directories.
+# name = emulator | boot path | optional launch args
+# My Special Game = pcsx2 | D:\Games\PS2\special.iso |

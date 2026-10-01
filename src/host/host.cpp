@@ -7,6 +7,8 @@
 #include "encoder/encoder.h"
 #include "input/input_injector.h"
 #include "input/input_mapper.h"
+#include "process/game_config.h"
+#include "process/process_manager.h"
 
 #include <atomic>
 #include <chrono>
@@ -30,7 +32,8 @@ extern "C" {
 
 namespace rps {
 
-void start_host_server(int port, bool &running, bool debug_audio) {
+void start_host_server(int port, bool &running, bool debug_audio,
+                       const std::string &config_path) {
   if (enet_initialize() != 0) {
     std::cerr << "[Host] Failed to initialize ENet\n";
     return;
@@ -128,6 +131,39 @@ void start_host_server(int port, bool &running, bool debug_audio) {
   if (!injector || !injector->init()) {
     std::cerr << "[Host] Failed to initialize input injector\n";
   }
+
+  // --- Game control plane ---
+  GameConfig game_config;
+  bool control_plane = false;
+  if (!config_path.empty() && load_game_config(config_path, game_config)) {
+    control_plane = true;
+    std::cout << "[Host] Loaded " << game_config.games.size()
+              << " games from " << config_path << "\n";
+  } else if (!config_path.empty()) {
+    std::cerr << "[Host] Control plane disabled (config load failed)\n";
+  }
+  ProcessManager process_manager;
+
+  // Send a control message (FrameHeader{CONTROL} + control_type + payload)
+  auto send_control = [&](ENetPeer *peer, ControlType type, const void *payload,
+                          size_t size) {
+    size_t total = sizeof(FrameHeader) + 1 + size;
+    ENetPacket *packet = enet_packet_create(nullptr, total,
+                                            ENET_PACKET_FLAG_RELIABLE);
+    FrameHeader header;
+    header.type = (uint8_t)PacketType::CONTROL;
+    header.flags = FLAG_NONE;
+    header.sequence_num = 0;
+    header.frame_id = 0;
+    header.timestamp_us = get_timestamp_us();
+    header.payload_size = (uint32_t)(1 + size);
+    memcpy(packet->data, &header, sizeof(FrameHeader));
+    uint8_t ctype = (uint8_t)type;
+    memcpy(packet->data + sizeof(FrameHeader), &ctype, 1);
+    if (size)
+      memcpy(packet->data + sizeof(FrameHeader) + 1, payload, size);
+    enet_peer_send(peer, 0, packet);
+  };
 
   auto frame_duration = std::chrono::microseconds(1000000 / enc_settings.fps);
   auto last_frame_time = std::chrono::steady_clock::now();
@@ -263,6 +299,43 @@ void start_host_server(int port, bool &running, bool debug_audio) {
             uint32_t vk = sdlk_to_vk((SDL_Keycode)kp.key);
             if (injector && vk != 0)
               injector->sendKey(vk, kp.down != 0);
+          } else if (hdr->type == (uint8_t)PacketType::CONTROL &&
+                     event.packet->dataLength >= sizeof(FrameHeader) + 1) {
+            uint8_t ctype = event.packet->data[sizeof(FrameHeader)];
+            const uint8_t *payload =
+                event.packet->data + sizeof(FrameHeader) + 1;
+            size_t payload_size =
+                event.packet->dataLength - sizeof(FrameHeader) - 1;
+
+            switch ((ControlType)ctype) {
+            case ControlType::LIST_GAMES: {
+              if (!control_plane)
+                break;
+              std::string list;
+              for (size_t i = 0; i < game_config.games.size(); ++i) {
+                const GameEntry &g = game_config.games[i];
+                list += std::to_string(i) + "|" +
+                        (g.emulator == EmulatorType::RPCS3 ? "rpcs3" : "pcsx2") +
+                        "|" + g.name + "\n";
+              }
+              send_control(event.peer, ControlType::GAME_LIST, list.data(),
+                           list.size());
+              break;
+            }
+            case ControlType::LAUNCH_GAME: {
+              if (!control_plane || payload_size < 4)
+                break;
+              uint32_t index = 0;
+              memcpy(&index, payload, 4);
+              process_manager.launch(game_config, index);
+              break;
+            }
+            case ControlType::CLOSE_GAME:
+              process_manager.close();
+              break;
+            default:
+              break;
+            }
           }
         }
         enet_packet_destroy(event.packet);

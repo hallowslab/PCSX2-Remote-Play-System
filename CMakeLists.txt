@@ -38,6 +38,8 @@ add_executable(remote-play
     src/host/capture/audio_capture.cpp
     src/host/input/sendinput_injector.cpp
     src/host/input/input_mapper.cpp
+    src/host/process/game_config.cpp
+    src/host/process/process_manager.cpp
     src/shared/protocol/protocol.cpp
     src/client/client.cpp
 )
@@ -65,3 +67,10 @@ else()
     find_package(enet REQUIRED)
     target_link_libraries(remote-play PRIVATE enet)
 endif()
+
+# Copy a sample config next to the binary so the user has a template to edit.
+add_custom_command(TARGET remote-play POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/config.ini.example
+        $<TARGET_FILE_DIR:remote-play>/config.ini.example
+    COMMENT "Copying sample config.ini.example")

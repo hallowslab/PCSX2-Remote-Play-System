@@ -44,7 +44,11 @@ enum class ControlType : uint8_t {
   PING = 4,
   PONG = 5,
   STREAM_PAUSED = 6,
-  STREAM_RESUMED = 7
+  STREAM_RESUMED = 7,
+  LIST_GAMES = 8,  // client->host: request game list
+  GAME_LIST = 9,   // host->client: "index|emulator|name\n" lines
+  LAUNCH_GAME = 10, // client->host: uint32 game index
+  CLOSE_GAME = 11   // client->host: no payload
 };
 
 #pragma pack(push, 1)

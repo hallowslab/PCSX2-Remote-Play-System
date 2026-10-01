@@ -7,6 +7,8 @@
 #include <iostream>
 #include <mutex>
 #include <queue>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -28,7 +30,8 @@ extern "C" {
 
 namespace rps {
 
-void start_client(const char *ip_addr, int port, bool &running) {
+void start_client(const char *ip_addr, int port, bool &running,
+                  const std::string &launch_name) {
   if (enet_initialize() != 0) {
     std::cerr << "[Client] Failed to initialize ENet\n";
     return;
@@ -176,6 +179,36 @@ void start_client(const char *ip_addr, int port, bool &running) {
   bool has_last_ip = false;
   auto last_input_time = std::chrono::steady_clock::now();
 
+  // --- Game list / control plane state ---
+  std::vector<std::string> game_names;
+  std::vector<uint32_t> game_indices;
+  bool overlay_open = false;
+  size_t selected = 0;
+
+  auto send_control = [&](ControlType type, const void *payload, size_t size) {
+    if (!peer)
+      return;
+    size_t total = sizeof(FrameHeader) + 1 + size;
+    ENetPacket *packet =
+        enet_packet_create(nullptr, total, ENET_PACKET_FLAG_RELIABLE);
+    FrameHeader header;
+    header.type = (uint8_t)PacketType::CONTROL;
+    header.flags = FLAG_NONE;
+    header.sequence_num = 0;
+    header.frame_id = 0;
+    header.timestamp_us = get_timestamp_us();
+    header.payload_size = (uint32_t)(1 + size);
+    memcpy(packet->data, &header, sizeof(FrameHeader));
+    uint8_t ctype = (uint8_t)type;
+    memcpy(packet->data + sizeof(FrameHeader), &ctype, 1);
+    if (size)
+      memcpy(packet->data + sizeof(FrameHeader) + 1, payload, size);
+    enet_peer_send(peer, 0, packet);
+  };
+
+  // Request the game list from the host.
+  send_control(ControlType::LIST_GAMES, nullptr, 0);
+
   // --- Audio Decoder Setup ---
   const AVCodec *audio_codec = avcodec_find_decoder(AV_CODEC_ID_OPUS);
   if (audio_codec) {
@@ -292,20 +325,39 @@ void start_client(const char *ip_addr, int port, bool &running) {
 
       if (sdl_event.type == SDL_EVENT_KEY_DOWN ||
           sdl_event.type == SDL_EVENT_KEY_UP) {
-        // Client-local hotkeys (not forwarded): Esc quits, F fullscreen.
-        if (sdl_event.type == SDL_EVENT_KEY_DOWN) {
-          if (sdl_event.key.key == SDLK_ESCAPE)
-            running = false;
-          if (sdl_event.key.key == SDLK_F) {
-            Uint32 flags = SDL_GetWindowFlags(win);
-            SDL_SetWindowFullscreen(win, !(flags & SDL_WINDOW_FULLSCREEN));
-          }
+        bool is_down = (sdl_event.type == SDL_EVENT_KEY_DOWN);
+        SDL_Keycode key = sdl_event.key.key;
+
+        // Home toggles the game list (reserved, never forwarded).
+        if (key == SDLK_HOME && is_down && !sdl_event.key.repeat) {
+          overlay_open = !overlay_open;
+          continue;
         }
-        if (sdl_event.key.key != SDLK_ESCAPE && sdl_event.key.key != SDLK_F &&
-            !sdl_event.key.repeat) {
+
+        // While the list is open, consume all keys for navigation.
+        if (overlay_open) {
+          if (is_down && !sdl_event.key.repeat) {
+            if (key == SDLK_UP && selected > 0)
+              selected--;
+            else if (key == SDLK_DOWN && selected + 1 < game_names.size())
+              selected++;
+            else if (key == SDLK_RETURN && selected < game_indices.size()) {
+              uint32_t idx = game_indices[selected];
+              send_control(ControlType::LAUNCH_GAME, &idx, 4);
+              overlay_open = false;
+            } else if (key == SDLK_DELETE)
+              send_control(ControlType::CLOSE_GAME, nullptr, 0);
+            else if (key == SDLK_ESCAPE)
+              overlay_open = false;
+          }
+          continue;
+        }
+
+        // Otherwise forward every key (ignore repeats).
+        if (!sdl_event.key.repeat) {
           KeyPacket kp;
-          kp.key = (uint32_t)sdl_event.key.key;
-          kp.down = sdl_event.key.down ? 1 : 0;
+          kp.key = (uint32_t)key;
+          kp.down = is_down ? 1 : 0;
           kp.reserved[0] = kp.reserved[1] = kp.reserved[2] = 0;
           send_input_packet((uint8_t)PacketType::KEYBOARD_EVENT, &kp,
                             sizeof(kp));
@@ -329,6 +381,55 @@ void start_client(const char *ip_addr, int port, bool &running) {
         if (total_pkts++ % 500 == 0) {
           std::cout << "[Client] Total packets received: " << total_pkts
                     << " (Last channel: " << (int)event.channelID << ")\n";
+        }
+
+        if (event.channelID == 0) {
+          // Control messages (game list, etc.)
+          if (event.packet->dataLength >= sizeof(FrameHeader) + 1) {
+            const FrameHeader *hdr =
+                reinterpret_cast<const FrameHeader *>(event.packet->data);
+            if (hdr->type == (uint8_t)PacketType::CONTROL) {
+              uint8_t ctype = event.packet->data[sizeof(FrameHeader)];
+              if (ctype == (uint8_t)ControlType::GAME_LIST) {
+                const char *data = reinterpret_cast<const char *>(
+                    event.packet->data + sizeof(FrameHeader) + 1);
+                size_t len = event.packet->dataLength - sizeof(FrameHeader) - 1;
+                game_names.clear();
+                game_indices.clear();
+                std::istringstream ss(std::string(data, len));
+                std::string line;
+                while (std::getline(ss, line)) {
+                  if (line.empty())
+                    continue;
+                  size_t p1 = line.find('|');
+                  if (p1 == std::string::npos)
+                    continue;
+                  size_t p2 = line.find('|', p1 + 1);
+                  uint32_t idx = (uint32_t)std::stoul(line.substr(0, p1));
+                  std::string name = (p2 != std::string::npos)
+                                         ? line.substr(p2 + 1)
+                                         : line.substr(p1 + 1);
+                  game_indices.push_back(idx);
+                  game_names.push_back(name);
+                }
+                if (!launch_name.empty()) {
+                  for (size_t i = 0; i < game_names.size(); ++i) {
+                    if (game_names[i] == launch_name) {
+                      uint32_t idx = game_indices[i];
+                      send_control(ControlType::LAUNCH_GAME, &idx, 4);
+                      break;
+                    }
+                  }
+                  overlay_open = false;
+                } else if (!game_names.empty()) {
+                  overlay_open = true;
+                  selected = 0;
+                }
+              }
+            }
+          }
+          enet_packet_destroy(event.packet);
+          continue;
         }
 
         if (event.channelID == 1) { // Video channel
@@ -368,6 +469,24 @@ void start_client(const char *ip_addr, int port, bool &running) {
 
                 SDL_RenderClear(renderer);
                 SDL_RenderTexture(renderer, texture, nullptr, nullptr);
+
+                if (overlay_open) {
+                  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 190);
+                  SDL_RenderFillRect(renderer, nullptr);
+                  float y = 40.0f;
+                  for (size_t i = 0; i < game_names.size(); ++i) {
+                    if (i == selected) {
+                      SDL_FRect r = {20.0f, y - 4.0f, 320.0f, 20.0f};
+                      SDL_SetRenderDrawColor(renderer, 70, 70, 210, 255);
+                      SDL_RenderFillRect(renderer, &r);
+                    }
+                    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+                    SDL_RenderDebugText(renderer, 20.0f, y,
+                                        game_names[i].c_str());
+                    y += 22.0f;
+                  }
+                }
+
                 SDL_RenderPresent(renderer);
               }
             }

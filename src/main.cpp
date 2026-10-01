@@ -23,6 +23,8 @@ int main(int argc, char *argv[]) {
 
   std::string mode;
   std::string ip;
+  std::string config_path = "config.ini";
+  std::string launch_name;
   int port = 51234;
   bool debug_audio = false;
 
@@ -33,20 +35,26 @@ int main(int argc, char *argv[]) {
   app.add_option("-p,--port", port, "Port to connect/listen on")
       ->default_val("51234");
 
+  app.add_option("-c,--config", config_path, "Host game library config path")
+      ->default_val("config.ini");
+
+  app.add_option("-l,--launch", launch_name, "Game name to launch on client")
+      ->default_val("");
+
   app.add_flag("--debug-audio", debug_audio,
                "Record raw PCM on host for debugging");
 
   CLI11_PARSE(app, argc, argv);
 
   if (mode == "host") {
-    rps::start_host_server(port, running, debug_audio);
+    rps::start_host_server(port, running, debug_audio, config_path);
   } else if (mode == "client") {
     if (ip == "") {
       std::cerr
           << "If running client you need to specify IP address: -i x.x.x.x\n";
       return 1;
     }
-    rps::start_client(ip.c_str(), port, running);
+    rps::start_client(ip.c_str(), port, running, launch_name);
   } else {
     std::cerr << "Invalid mode: use 'host' or 'client'\n";
     return 1;
