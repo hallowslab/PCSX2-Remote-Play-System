@@ -10,6 +10,26 @@
 
 namespace rps {
 
+namespace {
+struct EnumCtx {
+  DWORD pid;
+  HWND hwnd;
+};
+
+// Find the emulator's visible top-level window so we can ask it to close
+// gracefully (WM_CLOSE) instead of hard-killing the process.
+BOOL CALLBACK find_emu_window(HWND hwnd, LPARAM lparam) {
+  auto *ctx = reinterpret_cast<EnumCtx *>(lparam);
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid == ctx->pid && IsWindowVisible(hwnd)) {
+    ctx->hwnd = hwnd;
+    return FALSE;
+  }
+  return TRUE;
+}
+} // namespace
+
 ProcessManager::~ProcessManager() { close(); }
 
 bool ProcessManager::launch(const GameConfig &config, size_t game_index) {
@@ -30,7 +50,8 @@ bool ProcessManager::launch(const GameConfig &config, size_t game_index) {
   std::ostringstream cmdline;
   cmdline << "\"" << exe << "\" ";
   if (g.emulator == EmulatorType::PCSX2) {
-    cmdline << "-fullscreen -- \"" << g.boot_path << "\"";
+    // -batch: run headless and exit the emulator when the game closes.
+    cmdline << "-batch -fullscreen -- \"" << g.boot_path << "\"";
   } else {
     cmdline << "--no-gui --fullscreen \"" << g.boot_path << "\"";
   }
@@ -67,19 +88,40 @@ bool ProcessManager::launch(const GameConfig &config, size_t game_index) {
 
 void ProcessManager::close() {
 #ifdef _WIN32
-  if (m_process) {
-    TerminateProcess(m_process, 0);
-    WaitForSingleObject(m_process, 1000);
+  if (!m_process)
+    return;
+  // Graceful close: post WM_CLOSE so the emulator can shut down and flush
+  // saves. Only hard-kill if it does not exit in time.
+  EnumCtx ctx{GetProcessId(m_process), nullptr};
+  EnumWindows(find_emu_window, reinterpret_cast<LPARAM>(&ctx));
+  if (ctx.hwnd)
+    PostMessage(ctx.hwnd, WM_CLOSE, 0, 0);
+
+  DWORD wait = WaitForSingleObject(m_process, 5000);
+  if (wait == WAIT_OBJECT_0) {
     CloseHandle(m_process);
     m_process = nullptr;
-    std::cout << "[Process] Emulator terminated\n";
+    std::cout << "[Process] Emulator closed gracefully\n";
+    return;
   }
+
+  TerminateProcess(m_process, 0);
+  WaitForSingleObject(m_process, 1000);
+  CloseHandle(m_process);
+  m_process = nullptr;
+  std::cout << "[Process] Emulator terminated\n";
+#else
+  (void)0;
 #endif
 }
 
 bool ProcessManager::isRunning() const {
 #ifdef _WIN32
-  return m_process != nullptr;
+  if (!m_process)
+    return false;
+  // Signaled handle = process exited (with --batch, PCSX2 quits when the
+  // game closes). WAIT_TIMEOUT means it is still alive.
+  return WaitForSingleObject(m_process, 0) == WAIT_TIMEOUT;
 #else
   return false;
 #endif

@@ -1,9 +1,11 @@
 #include "client.h"
 #include "../shared/protocol/protocol.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <iostream>
 #include <mutex>
 #include <queue>
@@ -37,7 +39,7 @@ void start_client(const char *ip_addr, int port, bool &running,
     return;
   }
 
-  ENetHost *client = enet_host_create(nullptr, 1, 3, 0, 0);
+  ENetHost *client = enet_host_create(nullptr, 1, 4, 0, 0);
   if (client == nullptr) {
     std::cerr << "[Client] Failed to create ENet client\n";
     enet_deinitialize();
@@ -49,7 +51,7 @@ void start_client(const char *ip_addr, int port, bool &running,
   address.port = static_cast<enet_uint16>(port);
 
   std::cout << "[Client] Connecting to " << ip_addr << ":" << port << "...\n";
-  ENetPeer *peer = enet_host_connect(client, &address, 3, 0);
+  ENetPeer *peer = enet_host_connect(client, &address, 4, 0);
   if (peer == nullptr) {
     std::cerr << "[Client] No available peers for connection\n";
     enet_host_destroy(client);
@@ -125,8 +127,8 @@ void start_client(const char *ip_addr, int port, bool &running,
   };
   open_gamepad();
 
-  auto send_input_packet = [&](uint8_t type, const void *payload,
-                               size_t size) {
+  auto send_input_packet = [&](uint8_t type, const void *payload, size_t size,
+                               int channel, enet_uint32 flags) {
     if (!peer)
       return;
     FrameHeader header;
@@ -136,12 +138,12 @@ void start_client(const char *ip_addr, int port, bool &running,
     header.frame_id = 0;
     header.timestamp_us = get_timestamp_us();
     header.payload_size = (uint32_t)size;
-    ENetPacket *packet = enet_packet_create(
-        nullptr, sizeof(FrameHeader) + size, ENET_PACKET_FLAG_RELIABLE);
+    ENetPacket *packet =
+        enet_packet_create(nullptr, sizeof(FrameHeader) + size, flags);
     memcpy(packet->data, &header, sizeof(FrameHeader));
     if (size)
       memcpy(packet->data + sizeof(FrameHeader), payload, size);
-    enet_peer_send(peer, 0, packet);
+    enet_peer_send(peer, channel, packet);
   };
 
   auto build_input_packet = [&](SDL_Gamepad *g) {
@@ -175,15 +177,41 @@ void start_client(const char *ip_addr, int port, bool &running,
         (uint8_t)(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) >> 7);
     return ip;
   };
-  InputPacket last_ip = {};
-  bool has_last_ip = false;
   auto last_input_time = std::chrono::steady_clock::now();
 
   // --- Game list / control plane state ---
-  std::vector<std::string> game_names;
-  std::vector<uint32_t> game_indices;
+  enum class OverlayPage { EMULATORS, GRID };
+  struct GameItem {
+    std::string name;
+    uint32_t index;
+    uint8_t emu; // 0 = pcsx2, 1 = rpcs3
+  };
+  std::vector<GameItem> emu_pcsx2, emu_rpcs3;
+  std::vector<int> emu_present; // emu ids with games, in display order
   bool overlay_open = false;
-  size_t selected = 0;
+  bool list_loaded = false;
+  OverlayPage overlay_page = OverlayPage::EMULATORS;
+  int emu_selected = 0; // index into emu_present
+  size_t grid_selected = 0;
+  int grid_scroll = 0;
+  bool connected = true;
+  uint8_t game_status = (uint8_t)GameStatus::GAME_IDLE;
+  std::string game_status_name;
+  std::string game_status_reason;
+  std::string status_toast; // transient "Game closed: X" notice
+  auto toast_since = std::chrono::steady_clock::now();
+
+  auto current_games = [&]() -> std::vector<GameItem> & {
+    return emu_present[emu_selected] == 0 ? emu_pcsx2 : emu_rpcs3;
+  };
+  auto emu_label = [](int emu) -> const char * {
+    return emu == 0 ? "PCSX2" : "RPCS3";
+  };
+
+  // --- Streaming HUD state (FPS, round-trip, loss from ENet peer stats) ---
+  uint32_t hud_frames = 0;
+  float hud_fps = 0.0f;
+  auto hud_last = std::chrono::steady_clock::now();
 
   auto send_control = [&](ControlType type, const void *payload, size_t size) {
     if (!peer)
@@ -208,6 +236,192 @@ void start_client(const char *ip_addr, int port, bool &running,
 
   // Request the game list from the host.
   send_control(ControlType::LIST_GAMES, nullptr, 0);
+
+  auto game_status_text = [&]() -> std::string {
+    if (!connected)
+      return "Disconnected from host";
+    switch ((GameStatus)game_status) {
+    case GameStatus::GAME_LAUNCHING:
+      return "Launching: " + game_status_name;
+    case GameStatus::GAME_RUNNING:
+      return "Running: " + game_status_name;
+    case GameStatus::GAME_LAUNCH_FAILED:
+      return "Launch failed: " + game_status_name + " - " +
+             game_status_reason;
+    case GameStatus::GAME_IDLE:
+    default:
+      if (!status_toast.empty() &&
+          std::chrono::steady_clock::now() - toast_since <
+              std::chrono::seconds(4))
+        return status_toast;
+      return "Idle";
+    }
+  };
+
+  auto draw_status = [&](SDL_Renderer *r) {
+    bool toast_active =
+        !status_toast.empty() &&
+        std::chrono::steady_clock::now() - toast_since <
+            std::chrono::seconds(4);
+    bool show = !connected || game_status != (uint8_t)GameStatus::GAME_IDLE ||
+                overlay_open || toast_active;
+    if (!show)
+      return;
+    int w = 0, h = 0;
+    SDL_GetRenderOutputSize(r, &w, &h);
+    SDL_FRect bg = {0.0f, 0.0f, (float)w, 28.0f};
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 180);
+    SDL_RenderFillRect(r, &bg);
+    SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+    SDL_RenderDebugText(r, 10.0f, 6.0f, game_status_text().c_str());
+  };
+
+  // Small top-right overlay: decoded FPS, round-trip time, packet loss.
+  auto draw_hud = [&](SDL_Renderer *r) {
+    if (!peer)
+      return;
+    int w = 0, h = 0;
+    SDL_GetRenderOutputSize(r, &w, &h);
+    // ENet 1.3.18: packetLoss is a ratio scaled by
+    // ENET_PEER_PACKET_LOSS_SCALE (65536); roundTripTime is uint32 ms.
+    float loss = peer->packetLoss * 100.0f / (float)ENET_PEER_PACKET_LOSS_SCALE;
+    enet_uint32 rtt = peer->roundTripTime;
+    if (rtt == 0)
+      rtt = peer->lastRoundTripTime;
+    char line[128];
+    std::snprintf(line, sizeof(line), "%.0f fps  %u ms  %.1f%% loss",
+                  (double)hud_fps, rtt, (double)loss);
+    int tw = (int)std::strlen(line) * 8 + 16;
+    SDL_FRect bg = {(float)(w - tw), 4.0f, (float)tw, 22.0f};
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 150);
+    SDL_RenderFillRect(r, &bg);
+    SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+    SDL_RenderDebugText(r, (float)(w - tw + 8), 6.0f, line);
+  };
+
+  // Game launcher overlay: emulator pages -> game grid with placeholder tiles.
+  auto draw_overlay = [&](SDL_Renderer *r) {
+    int w = 0, h = 0;
+    SDL_GetRenderOutputSize(r, &w, &h);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 200);
+    SDL_RenderFillRect(r, nullptr);
+
+    if (overlay_page == OverlayPage::EMULATORS) {
+      SDL_SetRenderDrawColor(r, 220, 220, 220, 255);
+      SDL_RenderDebugText(
+          r, 24.0f, 20.0f,
+          "Choose an emulator  (arrows: move, Enter: select, Esc: close)");
+      if (!list_loaded) {
+        SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+        SDL_RenderDebugText(r, 24.0f, 64.0f, "Loading games...");
+      } else if (emu_present.empty()) {
+        SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+        SDL_RenderDebugText(r, 24.0f, 64.0f, "No games found");
+      } else {
+        const int tile_w = 260, tile_h = 170, gap = 24;
+        int total_w = (int)emu_present.size() * tile_w +
+                      (int)(emu_present.size() - 1) * gap;
+        int x0 = (w - total_w) / 2;
+        int y0 = (h - tile_h) / 2 - 10;
+        for (int i = 0; i < (int)emu_present.size(); ++i) {
+          int x = x0 + i * (tile_w + gap);
+          int emu = emu_present[i];
+          bool sel = (i == emu_selected);
+          SDL_FRect tile = {(float)x, (float)y0, (float)tile_w, (float)tile_h};
+          SDL_SetRenderDrawColor(r, sel ? 80 : 45, sel ? 130 : 45,
+                                 sel ? 220 : 55, 255);
+          SDL_RenderFillRect(r, &tile);
+          SDL_SetRenderDrawColor(r, sel ? 255 : 130, sel ? 255 : 130,
+                                 sel ? 255 : 130, 255);
+          SDL_RenderRect(r, &tile);
+          const char *label = emu_label(emu);
+          SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+          int tw = (int)std::strlen(label) * 8;
+          SDL_RenderDebugText(r, (float)(x + (tile_w - tw) / 2),
+                              (float)(y0 + 34), label);
+          size_t cnt = emu == 0 ? emu_pcsx2.size() : emu_rpcs3.size();
+          char cbuf[64];
+          std::snprintf(cbuf, sizeof(cbuf), "%zu games", cnt);
+          int cw = (int)std::strlen(cbuf) * 8;
+          SDL_RenderDebugText(r, (float)(x + (tile_w - cw) / 2),
+                              (float)(y0 + tile_h - 28), cbuf);
+        }
+      }
+    } else { // GRID
+      if (emu_present.empty()) {
+        overlay_page = OverlayPage::EMULATORS;
+        return;
+      }
+      const int tile_w = 180, tile_h = 132, gap = 14, margin = 30;
+      int cols = (std::max)(1, (w - 2 * margin + gap) / (tile_w + gap));
+      int rows_vis = (std::max)(1, (h - margin - 40) / (tile_h + gap));
+      auto &games = current_games();
+      size_t total = games.size();
+
+      char hbuf[128];
+      std::snprintf(hbuf, sizeof(hbuf),
+                    "%s  (Enter: launch, Esc: back, Home: close)",
+                    emu_label(emu_present[emu_selected]));
+      SDL_SetRenderDrawColor(r, 220, 220, 220, 255);
+      SDL_RenderDebugText(r, 24.0f, 18.0f, hbuf);
+      if (total == 0) {
+        SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+        SDL_RenderDebugText(r, 24.0f, 60.0f, "No games found");
+      }
+
+      size_t start = (size_t)grid_scroll * cols;
+      for (size_t i = start; i < total; ++i) {
+        int col = (int)((i - start) % cols);
+        int row = (int)((i - start) / cols);
+        if (row >= rows_vis)
+          break;
+        int x = margin + col * (tile_w + gap);
+        int y = margin + 14 + row * (tile_h + gap);
+        bool sel = (i == grid_selected);
+        bool run =
+            (game_status == (uint8_t)GameStatus::GAME_RUNNING ||
+             game_status == (uint8_t)GameStatus::GAME_LAUNCHING) &&
+            games[i].name == game_status_name;
+
+        // Placeholder art area — game image goes here later.
+        SDL_FRect art = {(float)x, (float)y, (float)tile_w,
+                         (float)(tile_h - 34)};
+        if (sel)
+          SDL_SetRenderDrawColor(r, 70, 110, 200, 255);
+        else if (run)
+          SDL_SetRenderDrawColor(r, 30, 120, 60, 255);
+        else
+          SDL_SetRenderDrawColor(r, 40, 40, 50, 255);
+        SDL_RenderFillRect(r, &art);
+
+        SDL_FRect strip = {(float)x, (float)(y + tile_h - 34), (float)tile_w,
+                           34.0f};
+        SDL_SetRenderDrawColor(r, 20, 20, 26, 255);
+        SDL_RenderFillRect(r, &strip);
+
+        std::string nm = games[i].name;
+        int maxc = tile_w / 8;
+        if ((int)nm.size() > maxc)
+          nm = nm.substr(0, (size_t)maxc - 1) + "~";
+        SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+        SDL_RenderDebugText(r, (float)(x + 6), (float)(y + tile_h - 30),
+                            nm.c_str());
+        if (run)
+          SDL_RenderDebugText(r, (float)(x + tile_w - 36), (float)(y + 6),
+                              "RUN");
+      }
+
+      int total_rows = (int)((total + cols - 1) / cols);
+      if (grid_scroll > 0) {
+        SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+        SDL_RenderDebugText(r, (float)(w / 2 - 4), (float)(margin - 14), "^");
+      }
+      if (grid_scroll + rows_vis < total_rows) {
+        SDL_SetRenderDrawColor(r, 255, 255, 255, 255);
+        SDL_RenderDebugText(r, (float)(w / 2 - 4), (float)(h - 22), "v");
+      }
+    }
+  };
 
   // --- Audio Decoder Setup ---
   const AVCodec *audio_codec = avcodec_find_decoder(AV_CODEC_ID_OPUS);
@@ -316,7 +530,19 @@ void start_client(const char *ip_addr, int port, bool &running,
     av_frame_free(&a_frame);
   });
 
+  auto last_render = std::chrono::steady_clock::now();
+
   while (running) {
+    // Decay/refresh the decoded-FPS figure for the HUD.
+    auto hud_now = std::chrono::steady_clock::now();
+    auto hud_dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      hud_now - hud_last)
+                      .count();
+    if (hud_dt >= 500) {
+      hud_fps = hud_frames * 1000.0f / (float)hud_dt;
+      hud_frames = 0;
+      hud_last = hud_now;
+    }
     // Handle SDL Events
     SDL_Event sdl_event;
     while (SDL_PollEvent(&sdl_event)) {
@@ -331,24 +557,62 @@ void start_client(const char *ip_addr, int port, bool &running,
         // Home toggles the game list (reserved, never forwarded).
         if (key == SDLK_HOME && is_down && !sdl_event.key.repeat) {
           overlay_open = !overlay_open;
+          if (overlay_open) {
+            overlay_page = OverlayPage::EMULATORS;
+            send_control(ControlType::LIST_GAMES, nullptr, 0);
+          }
           continue;
         }
 
         // While the list is open, consume all keys for navigation.
         if (overlay_open) {
           if (is_down && !sdl_event.key.repeat) {
-            if (key == SDLK_UP && selected > 0)
-              selected--;
-            else if (key == SDLK_DOWN && selected + 1 < game_names.size())
-              selected++;
-            else if (key == SDLK_RETURN && selected < game_indices.size()) {
-              uint32_t idx = game_indices[selected];
-              send_control(ControlType::LAUNCH_GAME, &idx, 4);
-              overlay_open = false;
-            } else if (key == SDLK_DELETE)
-              send_control(ControlType::CLOSE_GAME, nullptr, 0);
-            else if (key == SDLK_ESCAPE)
-              overlay_open = false;
+            if (overlay_page == OverlayPage::EMULATORS) {
+              if ((key == SDLK_LEFT || key == SDLK_UP) && emu_selected > 0)
+                emu_selected--;
+              else if ((key == SDLK_RIGHT || key == SDLK_DOWN) &&
+                       emu_selected + 1 < (int)emu_present.size())
+                emu_selected++;
+              else if (key == SDLK_RETURN && !emu_present.empty()) {
+                grid_selected = 0;
+                grid_scroll = 0;
+                overlay_page = OverlayPage::GRID;
+              } else if (key == SDLK_ESCAPE)
+                overlay_open = false;
+            } else { // GRID
+              auto &games = current_games();
+              size_t total = games.size();
+              int w = 0, h = 0;
+              SDL_GetRenderOutputSize(renderer, &w, &h);
+              const int tile_w = 180, tile_h = 132, gap = 14, margin = 30;
+              int cols = (std::max)(1, (w - 2 * margin + gap) / (tile_w + gap));
+              int rows_vis = (std::max)(1, (h - margin - 40) / (tile_h + gap));
+
+              if (key == SDLK_LEFT && grid_selected > 0)
+                grid_selected--;
+              else if (key == SDLK_RIGHT && grid_selected + 1 < total)
+                grid_selected++;
+              else if (key == SDLK_UP && grid_selected >= (size_t)cols)
+                grid_selected -= cols;
+              else if (key == SDLK_DOWN) {
+                size_t nxt = grid_selected + cols;
+                grid_selected = (nxt < total) ? nxt
+                                              : (total ? total - 1 : 0);
+              } else if (key == SDLK_RETURN && grid_selected < total) {
+                uint32_t idx = games[grid_selected].index;
+                send_control(ControlType::LAUNCH_GAME, &idx, 4);
+                overlay_open = false;
+              } else if (key == SDLK_ESCAPE)
+                overlay_page = OverlayPage::EMULATORS;
+
+              if (grid_selected >= total)
+                grid_selected = total ? total - 1 : 0;
+              int row = (int)(grid_selected / cols);
+              if (row < grid_scroll)
+                grid_scroll = row;
+              else if (row >= grid_scroll + rows_vis)
+                grid_scroll = row - rows_vis + 1;
+            }
           }
           continue;
         }
@@ -360,7 +624,7 @@ void start_client(const char *ip_addr, int port, bool &running,
           kp.down = is_down ? 1 : 0;
           kp.reserved[0] = kp.reserved[1] = kp.reserved[2] = 0;
           send_input_packet((uint8_t)PacketType::KEYBOARD_EVENT, &kp,
-                            sizeof(kp));
+                            sizeof(kp), 3, ENET_PACKET_FLAG_RELIABLE);
         }
       }
 
@@ -394,8 +658,8 @@ void start_client(const char *ip_addr, int port, bool &running,
                 const char *data = reinterpret_cast<const char *>(
                     event.packet->data + sizeof(FrameHeader) + 1);
                 size_t len = event.packet->dataLength - sizeof(FrameHeader) - 1;
-                game_names.clear();
-                game_indices.clear();
+                emu_pcsx2.clear();
+                emu_rpcs3.clear();
                 std::istringstream ss(std::string(data, len));
                 std::string line;
                 while (std::getline(ss, line)) {
@@ -406,24 +670,79 @@ void start_client(const char *ip_addr, int port, bool &running,
                     continue;
                   size_t p2 = line.find('|', p1 + 1);
                   uint32_t idx = (uint32_t)std::stoul(line.substr(0, p1));
+                  std::string emu =
+                      (p2 != std::string::npos)
+                          ? line.substr(p1 + 1, p2 - p1 - 1)
+                          : "pcsx2";
                   std::string name = (p2 != std::string::npos)
                                          ? line.substr(p2 + 1)
                                          : line.substr(p1 + 1);
-                  game_indices.push_back(idx);
-                  game_names.push_back(name);
+                  GameItem item{name, idx, (uint8_t)(emu == "rpcs3")};
+                  if (item.emu == 0)
+                    emu_pcsx2.push_back(item);
+                  else
+                    emu_rpcs3.push_back(item);
                 }
+                list_loaded = true;
+                emu_present.clear();
+                if (!emu_pcsx2.empty())
+                  emu_present.push_back(0);
+                if (!emu_rpcs3.empty())
+                  emu_present.push_back(1);
+                if (emu_selected >= (int)emu_present.size())
+                  emu_selected = 0;
+                grid_selected = 0;
+                grid_scroll = 0;
+
                 if (!launch_name.empty()) {
-                  for (size_t i = 0; i < game_names.size(); ++i) {
-                    if (game_names[i] == launch_name) {
-                      uint32_t idx = game_indices[i];
-                      send_control(ControlType::LAUNCH_GAME, &idx, 4);
+                  bool found = false;
+                  for (const auto &it : emu_pcsx2)
+                    if (it.name == launch_name) {
+                      send_control(ControlType::LAUNCH_GAME, &it.index, 4);
+                      found = true;
                       break;
                     }
-                  }
+                  if (!found)
+                    for (const auto &it : emu_rpcs3)
+                      if (it.name == launch_name) {
+                        send_control(ControlType::LAUNCH_GAME, &it.index, 4);
+                        break;
+                      }
                   overlay_open = false;
-                } else if (!game_names.empty()) {
+                } else if (!emu_present.empty()) {
                   overlay_open = true;
-                  selected = 0;
+                  overlay_page = OverlayPage::EMULATORS;
+                }
+              } else if (ctype == (uint8_t)ControlType::GAME_STATUS) {
+                const uint8_t *d = reinterpret_cast<const uint8_t *>(
+                    event.packet->data + sizeof(FrameHeader) + 1);
+                size_t len = event.packet->dataLength - sizeof(FrameHeader) - 1;
+                uint8_t prev_status = game_status;
+                std::string prev_name = game_status_name;
+                game_status_name.clear();
+                game_status_reason.clear();
+                if (len >= 2) {
+                  game_status = d[0];
+                  uint8_t name_len = d[1];
+                  size_t off = 2;
+                  if (off + name_len <= len) {
+                    game_status_name.assign((const char *)d + off, name_len);
+                    off += name_len;
+                  }
+                  if (off < len) {
+                    uint8_t reason_len = d[off++];
+                    if (off + reason_len <= len)
+                      game_status_reason.assign((const char *)d + off,
+                                                reason_len);
+                  }
+                }
+                if (prev_status == (uint8_t)GameStatus::GAME_RUNNING &&
+                    game_status == (uint8_t)GameStatus::GAME_IDLE) {
+                  status_toast = "Game closed: " + prev_name;
+                  toast_since = std::chrono::steady_clock::now();
+                } else if (prev_status != (uint8_t)GameStatus::GAME_IDLE ||
+                           game_status != (uint8_t)GameStatus::GAME_IDLE) {
+                  status_toast.clear();
                 }
               }
             }
@@ -467,27 +786,7 @@ void start_client(const char *ip_addr, int port, bool &running,
                                        frame->linesize[2]);
                 }
 
-                SDL_RenderClear(renderer);
-                SDL_RenderTexture(renderer, texture, nullptr, nullptr);
-
-                if (overlay_open) {
-                  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 190);
-                  SDL_RenderFillRect(renderer, nullptr);
-                  float y = 40.0f;
-                  for (size_t i = 0; i < game_names.size(); ++i) {
-                    if (i == selected) {
-                      SDL_FRect r = {20.0f, y - 4.0f, 320.0f, 20.0f};
-                      SDL_SetRenderDrawColor(renderer, 70, 70, 210, 255);
-                      SDL_RenderFillRect(renderer, &r);
-                    }
-                    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-                    SDL_RenderDebugText(renderer, 20.0f, y,
-                                        game_names[i].c_str());
-                    y += 22.0f;
-                  }
-                }
-
-                SDL_RenderPresent(renderer);
+hud_frames++;
               }
             }
           }
@@ -507,21 +806,49 @@ void start_client(const char *ip_addr, int port, bool &running,
         enet_packet_destroy(event.packet);
       } else if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
         std::cout << "[Client] Connection lost\n";
+        connected = false;
         running = false;
       }
     }
 
-    // Gamepad state -> InputPacket at ~125 Hz (8 ms), send on change.
+    // Gamepad state -> InputPacket at ~125 Hz (8 ms). Sent every tick, not just
+    // on change: unreliable packets can drop, and resending the full state
+    // lets the host recover within one tick instead of missing an input.
     auto now_input = std::chrono::steady_clock::now();
     if (gamepad &&
         now_input - last_input_time >= std::chrono::milliseconds(8)) {
       last_input_time = now_input;
       InputPacket ip = build_input_packet(gamepad);
-      if (!has_last_ip || memcmp(&ip, &last_ip, sizeof(ip)) != 0) {
-        last_ip = ip;
-        has_last_ip = true;
-        send_input_packet((uint8_t)PacketType::INPUT_EVENT, &ip, sizeof(ip));
+      send_input_packet((uint8_t)PacketType::INPUT_EVENT, &ip, sizeof(ip), 3, 0);
+    }
+
+    // Render once per tick while the launcher is open (menu/status respond
+    // instantly even if video stalls); otherwise cap to ~60 fps and reuse the
+    // last decoded texture.
+    auto render_now = std::chrono::steady_clock::now();
+    bool need_render =
+        overlay_open || !texture ||
+        std::chrono::duration_cast<std::chrono::milliseconds>(render_now -
+                                                              last_render)
+                .count() >= 16;
+    if (need_render) {
+      last_render = render_now;
+      SDL_SetRenderDrawColor(renderer, 16, 16, 16, 255);
+      SDL_RenderClear(renderer);
+      if (texture)
+        SDL_RenderTexture(renderer, texture, nullptr, nullptr);
+      draw_status(renderer);
+      if (overlay_open)
+        draw_overlay(renderer);
+      else if (texture)
+        draw_hud(renderer);
+      else {
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+        SDL_RenderDebugText(
+            renderer, 20.0f, 20.0f,
+            connected ? "Connecting to host..." : "Disconnected from host");
       }
+      SDL_RenderPresent(renderer);
     }
   }
 

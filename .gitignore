@@ -4,3 +4,6 @@ vcpkg_installed/
 .vs
 .vscode
 notes/
+hidmaestro-test/
+hidmaestro-bridge/bin/
+hidmaestro-bridge/obj/

@@ -18,6 +18,7 @@ struct GameConfig {
   std::string pcsx2_path;
   std::string rpcs3_path;
   std::vector<GameEntry> games;
+  bool analog_input = false; // [input] analog = true -> HIDMaestro analog gamepad
 };
 
 // Parse config.ini. Returns false on failure (file missing/unreadable).

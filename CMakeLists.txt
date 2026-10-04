@@ -38,6 +38,7 @@ add_executable(remote-play
     src/host/capture/audio_capture.cpp
     src/host/input/sendinput_injector.cpp
     src/host/input/input_mapper.cpp
+    src/host/input/hidmaestro_injector.cpp
     src/host/process/game_config.cpp
     src/host/process/process_manager.cpp
     src/shared/protocol/protocol.cpp
@@ -56,7 +57,7 @@ target_link_libraries(remote-play
 )
 
 if(WIN32)
-    target_link_libraries(remote-play PRIVATE ws2_32 d3d11 dxgi winmm)
+    target_link_libraries(remote-play PRIVATE ws2_32 d3d11 dxgi winmm shell32)
 endif()
 
 # Link ENet
@@ -74,3 +75,25 @@ add_custom_command(TARGET remote-play POST_BUILD
         ${CMAKE_SOURCE_DIR}/config.ini.example
         $<TARGET_FILE_DIR:remote-play>/config.ini.example
     COMMENT "Copying sample config.ini.example")
+
+# Build + ship the HIDMaestro analog-controller bridge (Windows, optional).
+if(WIN32)
+    set(BRIDGE_DIR "${CMAKE_SOURCE_DIR}/hidmaestro-bridge")
+    if(EXISTS "${BRIDGE_DIR}/HIDMaestro.Core.dll")
+        find_program(DOTNET_EXE dotnet)
+        if(DOTNET_EXE)
+            add_custom_command(TARGET remote-play POST_BUILD
+                COMMAND ${DOTNET_EXE} publish "${BRIDGE_DIR}/HidMaestroBridge.csproj"
+                        -c Release -r win-x64 -o "$<TARGET_FILE_DIR:remote-play>"
+                        --nologo -v quiet
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        "${BRIDGE_DIR}/HIDMAESTRO_LICENSE"
+                        "$<TARGET_FILE_DIR:remote-play>/HIDMAESTRO_LICENSE"
+                COMMENT "Publishing HIDMaestro bridge + license")
+        else()
+            message(WARNING "dotnet not found; HIDMaestro bridge will not be built")
+        endif()
+    else()
+        message(WARNING "HIDMaestro.Core.dll missing from hidmaestro-bridge/; analog input unavailable")
+    endif()
+endif()

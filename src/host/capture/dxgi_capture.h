@@ -29,6 +29,7 @@ public:
 private:
     bool initDXGI();
     bool createStagingTexture();
+    bool reinitDXGI();
 
     ComPtr<ID3D11Device> m_device;
     ComPtr<ID3D11DeviceContext> m_context;
@@ -42,6 +43,7 @@ private:
     bool m_frameMapped = false;
     CaptureError m_lastError = CaptureError::None;
     D3D11_MAPPED_SUBRESOURCE m_mappedResource = {};
+    ULONGLONG m_lastReinitTick = 0;
 };
 
 } // namespace rps

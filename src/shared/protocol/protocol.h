@@ -48,7 +48,18 @@ enum class ControlType : uint8_t {
   LIST_GAMES = 8,  // client->host: request game list
   GAME_LIST = 9,   // host->client: "index|emulator|name\n" lines
   LAUNCH_GAME = 10, // client->host: uint32 game index
-  CLOSE_GAME = 11   // client->host: no payload
+  GAME_STATUS = 12  // host->client: GameStatus byte + name/reason (see below)
+};
+
+// Game lifecycle status carried by GAME_STATUS. Payload layout:
+//   [0]    status (GameStatus)
+//   [1]    name_len (uint8), then name_len bytes of running/launching game name
+//   [1+1+n] reason_len (uint8), then reason_len bytes (LAUNCH_FAILED detail)
+enum GameStatus : uint8_t {
+  GAME_IDLE = 0,
+  GAME_LAUNCHING = 1,
+  GAME_RUNNING = 2,
+  GAME_LAUNCH_FAILED = 3,
 };
 
 #pragma pack(push, 1)

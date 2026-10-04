@@ -65,8 +65,24 @@ static void add_game(std::vector<GameEntry> &out, const fs::path &boot,
   out.push_back(std::move(e));
 }
 
-// Collect PCSX2 image files directly inside `dir` (one level), deduping
-// bin/cue pairs so they count as one game.
+// True if `bin` is a track referenced by the cue sheet named `cueStem`
+// (stem-equal, or stem-prefix like "game (Track 1)"). PCSX2 boots the .bin,
+// not the .cue.
+static bool bin_belongs_to_cue(const fs::path &bin, const std::string &cueStem) {
+  std::string stem = lower(bin.stem().string());
+  std::string cue = lower(cueStem);
+  if (stem == cue)
+    return true;
+  if (stem.size() > cue.size() && stem.compare(0, cue.size(), cue) == 0) {
+    char nxt = stem[cue.size()];
+    return !(std::isalnum((unsigned char)nxt));
+  }
+  return false;
+}
+
+// Collect PCSX2 image files directly inside `dir` (one level). A .cue is a
+// cue sheet, not a bootable image: when a matching .bin exists, keep the
+// .bin and drop the .cue so the game boots from the actual disc image.
 static std::vector<fs::path> collect_images(const fs::path &dir) {
   std::vector<fs::path> images;
   std::vector<std::string> cues;
@@ -81,18 +97,29 @@ static std::vector<fs::path> collect_images(const fs::path &dir) {
     images.push_back(inner.path());
   }
   for (auto it = images.begin(); it != images.end();) {
-    if (lower(it->extension().string()) == ".bin" &&
-        std::find(cues.begin(), cues.end(), it->stem().string()) != cues.end())
-      it = images.erase(it);
-    else
+    if (lower(it->extension().string()) == ".cue") {
+      bool hasBin = false;
+      for (const auto &f : images)
+        if (lower(f.extension().string()) == ".bin" &&
+            bin_belongs_to_cue(f, it->stem().string())) {
+          hasBin = true;
+          break;
+        }
+      if (hasBin)
+        it = images.erase(it);
+      else
+        ++it;
+    } else {
       ++it;
+    }
   }
   return images;
 }
 
-// Prefer .iso > .cue > .img > .elf > .bin when a folder holds multiple images.
+// Prefer .iso > .img > .elf > .bin > .cue when a folder holds multiple images.
+// .cue is last: it is only bootable when no matching .bin exists.
 static fs::path prefer_image(const std::vector<fs::path> &images) {
-  static const char *pref[] = {".iso", ".cue", ".img", ".elf", ".bin"};
+  static const char *pref[] = {".iso", ".img", ".elf", ".bin", ".cue"};
   for (const char *p : pref)
     for (const auto &f : images)
       if (lower(f.extension().string()) == p)
@@ -109,9 +136,25 @@ static void scan_pcsx2_dir(const fs::path &dir, std::vector<GameEntry> &out) {
 
   for (const auto &entry : fs::directory_iterator(dir, ec)) {
     if (entry.is_regular_file(ec)) {
-      if (is_pcsx2_image(entry.path()))
-        add_game(out, entry.path(), entry.path().stem().string(),
-                 EmulatorType::PCSX2);
+      if (!is_pcsx2_image(entry.path()))
+        continue;
+      // Skip a loose .cue that has a matching .bin next to it; the .bin is
+      // the bootable image (PCSX2 does not read cue sheets).
+      if (lower(entry.path().extension().string()) == ".cue") {
+        bool hasBin = false;
+        for (const auto &sib : fs::directory_iterator(dir, ec)) {
+          if (sib.is_regular_file(ec) &&
+              lower(sib.path().extension().string()) == ".bin" &&
+              bin_belongs_to_cue(sib.path(), entry.path().stem().string())) {
+            hasBin = true;
+            break;
+          }
+        }
+        if (hasBin)
+          continue;
+      }
+      add_game(out, entry.path(), entry.path().stem().string(),
+               EmulatorType::PCSX2);
     } else if (entry.is_directory(ec)) {
       std::vector<fs::path> images = collect_images(entry.path());
       if (!images.empty())
@@ -204,6 +247,9 @@ bool load_game_config(const std::string &path, GameConfig &out) {
       out.pcsx2_path = value;
     } else if (section == "rpcs3" && key == "path") {
       out.rpcs3_path = value;
+    } else if (section == "input" && key == "analog") {
+      out.analog_input =
+          (value == "true" || value == "1" || value == "yes" || value == "on");
     } else if (section == "games") {
       // value = "emulator | boot path | args" (individual game override)
       std::vector<std::string> fields = split(value, '|');

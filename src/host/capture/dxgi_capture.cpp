@@ -104,6 +104,18 @@ bool DXGICapture::initDXGI() {
   return true;
 }
 
+bool DXGICapture::reinitDXGI() {
+  m_duplication.Reset();
+  m_stagingTexture.Reset();
+  m_context.Reset();
+  m_device.Reset();
+  if (!initDXGI())
+    return false;
+  if (!createStagingTexture())
+    return false;
+  return true;
+}
+
 bool DXGICapture::createStagingTexture() {
   D3D11_TEXTURE2D_DESC desc = {};
   desc.Width = m_width;
@@ -164,9 +176,17 @@ bool DXGICapture::acquireFrame(CapturedFrame &frame, int timeout_ms) {
   }
   if (FAILED(hr)) {
     if (hr == DXGI_ERROR_ACCESS_LOST) {
+      // The duplication handle is invalid (display mode / GPU / DWM change).
+      // Recreate it; if that succeeds, retry this frame once. Throttle so a
+      // persistent failure doesn't rebuild DXGI on every frame.
+      ULONGLONG now = GetTickCount64();
+      if (now - m_lastReinitTick >= 500) {
+        m_lastReinitTick = now;
+        std::cerr << "[DXGICapture] Device lost, reinitializing\n";
+        if (reinitDXGI())
+          return acquireFrame(frame, timeout_ms);
+      }
       m_lastError = CaptureError::DeviceLost;
-      std::cerr << "[DXGICapture] Device lost, need to reinitialize"
-                << std::endl;
     } else {
       m_lastError = CaptureError::Unknown;
     }

@@ -22,3 +22,10 @@ rpcs3  | D:\Games\PS3\ISO
 # [games] — optional: individual games on top of the scanned directories.
 # name = emulator | boot path | optional launch args
 # My Special Game = pcsx2 | D:\Games\PS2\special.iso |
+
+[input]
+# analog = true  -> use HIDMaestro virtual controller (real analog sticks/triggers).
+#                   Requires the HIDMaestro bridge next to remote-play.exe and a
+#                   one-time UAC prompt on each host start.
+# analog = false -> controller mapped to keyboard keys (digital). No driver, no UAC.
+analog = false

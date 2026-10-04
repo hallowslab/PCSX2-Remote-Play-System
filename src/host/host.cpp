@@ -7,15 +7,18 @@
 #include "encoder/encoder.h"
 #include "input/input_injector.h"
 #include "input/input_mapper.h"
+#include "input/hidmaestro_injector.h"
 #include "process/game_config.h"
 #include "process/process_manager.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -50,9 +53,9 @@ void start_host_server(int port, bool &running, bool debug_audio,
   address.host = ENET_HOST_ANY;
   address.port = static_cast<enet_uint16>(port);
 
-  // Create host with 1 client connection, 3 channels (0: reliable control, 1:
-  // video, 2: audio)
-  ENetHost *server = enet_host_create(&address, 1, 3, 0, 0);
+  // Create host with 1 client connection, 4 channels (0: reliable control, 1:
+  // video, 2: audio, 3: input).
+  ENetHost *server = enet_host_create(&address, 1, 4, 0, 0);
   if (server == nullptr) {
     std::cerr << "[Host] Failed to create ENet server\n";
     enet_deinitialize();
@@ -144,6 +147,26 @@ void start_host_server(int port, bool &running, bool debug_audio,
   }
   ProcessManager process_manager;
 
+  // Optional analog gamepad via HIDMaestro bridge (opt-in: [input] analog=true).
+  // Initialized on a background thread: the UAC prompt / driver setup can take
+  // tens of seconds, and blocking here would leave clients unable to connect
+  // until it finished. The pointer is published atomically when ready; input
+  // falls back to the digital mapper until then.
+  std::atomic<HidMaestroInjector *> analog{nullptr};
+  if (game_config.analog_input) {
+    std::thread([&]() {
+      auto *inj = new HidMaestroInjector();
+      if (inj->init()) {
+        std::cout << "[Host] Analog controller injection enabled (HIDMaestro)\n";
+        analog.store(inj);
+      } else {
+        delete inj;
+        std::cout << "[Host] Analog injection unavailable; using digital "
+                     "key-mapping\n";
+      }
+    }).detach();
+  }
+
   // Send a control message (FrameHeader{CONTROL} + control_type + payload)
   auto send_control = [&](ENetPeer *peer, ControlType type, const void *payload,
                           size_t size) {
@@ -163,6 +186,27 @@ void start_host_server(int port, bool &running, bool debug_audio,
     if (size)
       memcpy(packet->data + sizeof(FrameHeader) + 1, payload, size);
     enet_peer_send(peer, 0, packet);
+  };
+
+  // --- Game lifecycle status (GAME_STATUS) ---
+  uint8_t game_status = (uint8_t)GameStatus::GAME_IDLE;
+  std::string current_game;
+  std::string game_status_reason;
+  auto send_game_status = [&](ENetPeer *peer) {
+    if (!peer)
+      return;
+    std::vector<uint8_t> payload;
+    payload.push_back(game_status);
+    uint8_t name_len = (uint8_t)std::min<size_t>(current_game.size(), 255);
+    payload.push_back(name_len);
+    payload.insert(payload.end(), current_game.begin(),
+                   current_game.begin() + name_len);
+    uint8_t reason_len =
+        (uint8_t)std::min<size_t>(game_status_reason.size(), 255);
+    payload.push_back(reason_len);
+    payload.insert(payload.end(), game_status_reason.begin(),
+                   game_status_reason.begin() + reason_len);
+    send_control(peer, ControlType::GAME_STATUS, payload.data(), payload.size());
   };
 
   auto frame_duration = std::chrono::microseconds(1000000 / enc_settings.fps);
@@ -272,20 +316,30 @@ void start_host_server(int port, bool &running, bool debug_audio,
                   << event.peer->address.port << "\n";
         client_peer.store(event.peer);
         streaming = true;
+        send_game_status(event.peer);
         break;
 
       case ENET_EVENT_TYPE_RECEIVE: {
-        if (event.channelID == 0 &&
-            event.packet->dataLength >= sizeof(FrameHeader)) {
-          const FrameHeader *hdr =
-              reinterpret_cast<const FrameHeader *>(event.packet->data);
+        if (event.packet->dataLength < sizeof(FrameHeader)) {
+          enet_packet_destroy(event.packet);
+          break;
+        }
+        const FrameHeader *hdr =
+            reinterpret_cast<const FrameHeader *>(event.packet->data);
+        // Input on channel 3 (gamepad unreliable, keyboard reliable), kept off
+        // the control channel so input pressure can't throttle video/audio or
+        // delay control messages.
+        if (event.channelID == 3) {
           if (hdr->type == (uint8_t)PacketType::INPUT_EVENT &&
               event.packet->dataLength >=
                   sizeof(FrameHeader) + sizeof(InputPacket)) {
             InputPacket ip;
             memcpy(&ip, event.packet->data + sizeof(FrameHeader),
                    sizeof(InputPacket));
-            if (injector && !injector->sendGamepadState(ip)) {
+            HidMaestroInjector *ana = analog.load();
+            if (ana && ana->sendGamepadState(ip)) {
+              // analog injection handled
+            } else if (injector) {
               mapper.processGamepad(ip, [&](uint32_t vk, bool down) {
                 injector->sendKey(vk, down);
               });
@@ -299,8 +353,10 @@ void start_host_server(int port, bool &running, bool debug_audio,
             uint32_t vk = sdlk_to_vk((SDL_Keycode)kp.key);
             if (injector && vk != 0)
               injector->sendKey(vk, kp.down != 0);
-          } else if (hdr->type == (uint8_t)PacketType::CONTROL &&
-                     event.packet->dataLength >= sizeof(FrameHeader) + 1) {
+          }
+        } else if (event.channelID == 0 &&
+                   hdr->type == (uint8_t)PacketType::CONTROL &&
+                   event.packet->dataLength >= sizeof(FrameHeader) + 1) {
             uint8_t ctype = event.packet->data[sizeof(FrameHeader)];
             const uint8_t *payload =
                 event.packet->data + sizeof(FrameHeader) + 1;
@@ -327,17 +383,30 @@ void start_host_server(int port, bool &running, bool debug_audio,
                 break;
               uint32_t index = 0;
               memcpy(&index, payload, 4);
-              process_manager.launch(game_config, index);
+              if (index >= game_config.games.size()) {
+                game_status = (uint8_t)GameStatus::GAME_LAUNCH_FAILED;
+                current_game.clear();
+                game_status_reason = "invalid game index";
+                send_game_status(event.peer);
+                break;
+              }
+              current_game = game_config.games[index].name;
+              game_status_reason.clear();
+              game_status = (uint8_t)GameStatus::GAME_LAUNCHING;
+              send_game_status(event.peer);
+              if (process_manager.launch(game_config, index)) {
+                game_status = (uint8_t)GameStatus::GAME_RUNNING;
+              } else {
+                game_status = (uint8_t)GameStatus::GAME_LAUNCH_FAILED;
+                game_status_reason = "launch failed";
+              }
+              send_game_status(event.peer);
               break;
             }
-            case ControlType::CLOSE_GAME:
-              process_manager.close();
-              break;
             default:
               break;
             }
           }
-        }
         enet_packet_destroy(event.packet);
         break;
       }
@@ -352,6 +421,17 @@ void start_host_server(int port, bool &running, bool debug_audio,
       default:
         break;
       }
+    }
+
+    // Detect emulator exit (PCSX2 --batch quits when the game closes).
+    if (game_status == (uint8_t)GameStatus::GAME_RUNNING &&
+        !process_manager.isRunning()) {
+      std::cout << "[Host] Game closed: " << current_game << "\n";
+      game_status = (uint8_t)GameStatus::GAME_IDLE;
+      current_game.clear();
+      game_status_reason.clear();
+      if (ENetPeer *p = client_peer.load())
+        send_game_status(p);
     }
 
     ENetPeer *peer = client_peer.load();
