@@ -51,30 +51,40 @@ void start_client(const char *ip_addr, int port, bool &running,
   address.port = static_cast<enet_uint16>(port);
 
   std::cout << "[Client] Connecting to " << ip_addr << ":" << port << "...\n";
-  ENetPeer *peer = enet_host_connect(client, &address, 4, 0);
-  if (peer == nullptr) {
-    std::cerr << "[Client] No available peers for connection\n";
-    enet_host_destroy(client);
-    enet_deinitialize();
-    return;
-  }
 
+  // Keep retrying until the host accepts. The host may be busy (HIDMaestro
+  // setup, or a stale peer slot after a previous abrupt disconnect), so a
+  // single 5s attempt would fail and force the user to relaunch.
+  ENetPeer *peer = nullptr;
+  bool connected_ok = false;
   ENetEvent event;
-  if (enet_host_service(client, &event, 5000) > 0 &&
-      event.type == ENET_EVENT_TYPE_CONNECT) {
-    std::cout << "[Client] Connected to host.\n";
-  } else {
-    std::cerr << "[Client] Connection failed\n";
-    enet_peer_reset(peer);
-    enet_host_destroy(client);
-    enet_deinitialize();
-    return;
+  while (!connected_ok) {
+    peer = enet_host_connect(client, &address, 4, 0);
+    if (peer == nullptr) {
+      std::cerr << "[Client] No available peers for connection\n";
+      enet_host_destroy(client);
+      enet_deinitialize();
+      return;
+    }
+    if (enet_host_service(client, &event, 5000) > 0 &&
+        event.type == ENET_EVENT_TYPE_CONNECT) {
+      connected_ok = true;
+      std::cout << "[Client] Connected to host.\n";
+    } else {
+      enet_peer_reset(peer);
+      std::cout << "[Client] Connection failed, retrying in 2s...\n";
+      std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
   }
 
   // Initialize decoder
   const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
   if (!codec) {
     std::cerr << "[Client] H264 decoder not found\n";
+    if (peer) {
+      enet_peer_disconnect(peer, 0);
+      enet_host_flush(client);
+    }
     enet_host_destroy(client);
     return;
   }
@@ -106,7 +116,9 @@ void start_client(const char *ip_addr, int port, bool &running,
   SDL_Window *win =
       SDL_CreateWindow("PCSX2 Remote Play", 1280, 720, SDL_WINDOW_RESIZABLE);
   SDL_Renderer *renderer = SDL_CreateRenderer(win, nullptr);
-  SDL_SetRenderVSync(renderer, 0);
+  // Vsync on: the decode/render loop runs unthrottled against display refresh,
+  // and a zero-copy present without vsync produces tearing during motion.
+  SDL_SetRenderVSync(renderer, 1);
 
   SDL_Texture *texture = nullptr;
   int texture_width = 0;
@@ -200,6 +212,7 @@ void start_client(const char *ip_addr, int port, bool &running,
   std::string game_status_reason;
   std::string status_toast; // transient "Game closed: X" notice
   auto toast_since = std::chrono::steady_clock::now();
+  uint64_t toast_ms = 4000;
 
   auto current_games = [&]() -> std::vector<GameItem> & {
     return emu_present[emu_selected] == 0 ? emu_pcsx2 : emu_rpcs3;
@@ -240,6 +253,10 @@ void start_client(const char *ip_addr, int port, bool &running,
   auto game_status_text = [&]() -> std::string {
     if (!connected)
       return "Disconnected from host";
+    if (!status_toast.empty() &&
+        std::chrono::steady_clock::now() - toast_since <
+            std::chrono::milliseconds(toast_ms))
+      return status_toast;
     switch ((GameStatus)game_status) {
     case GameStatus::GAME_LAUNCHING:
       return "Launching: " + game_status_name;
@@ -250,10 +267,6 @@ void start_client(const char *ip_addr, int port, bool &running,
              game_status_reason;
     case GameStatus::GAME_IDLE:
     default:
-      if (!status_toast.empty() &&
-          std::chrono::steady_clock::now() - toast_since <
-              std::chrono::seconds(4))
-        return status_toast;
       return "Idle";
     }
   };
@@ -262,7 +275,7 @@ void start_client(const char *ip_addr, int port, bool &running,
     bool toast_active =
         !status_toast.empty() &&
         std::chrono::steady_clock::now() - toast_since <
-            std::chrono::seconds(4);
+            std::chrono::milliseconds(toast_ms);
     bool show = !connected || game_status != (uint8_t)GameStatus::GAME_IDLE ||
                 overlay_open || toast_active;
     if (!show)
@@ -623,8 +636,11 @@ void start_client(const char *ip_addr, int port, bool &running,
           kp.key = (uint32_t)key;
           kp.down = is_down ? 1 : 0;
           kp.reserved[0] = kp.reserved[1] = kp.reserved[2] = 0;
+          // Keyboard is reliable but must live on a reliable-only channel
+          // (channel 0). Sharing channel 3 with the unreliable gamepad stream
+          // lets a dropped gamepad frame stall reliable key delivery.
           send_input_packet((uint8_t)PacketType::KEYBOARD_EVENT, &kp,
-                            sizeof(kp), 3, ENET_PACKET_FLAG_RELIABLE);
+                            sizeof(kp), 0, ENET_PACKET_FLAG_RELIABLE);
         }
       }
 
@@ -740,9 +756,22 @@ void start_client(const char *ip_addr, int port, bool &running,
                     game_status == (uint8_t)GameStatus::GAME_IDLE) {
                   status_toast = "Game closed: " + prev_name;
                   toast_since = std::chrono::steady_clock::now();
-                } else if (prev_status != (uint8_t)GameStatus::GAME_IDLE ||
-                           game_status != (uint8_t)GameStatus::GAME_IDLE) {
-                  status_toast.clear();
+                  toast_ms = 4000;
+                }
+                // RPCS3 exclusive fullscreen is a user setting we must not
+                // touch; remind the user once when such a game launches.
+                if ((game_status == (uint8_t)GameStatus::GAME_LAUNCHING ||
+                     game_status == (uint8_t)GameStatus::GAME_RUNNING) &&
+                    prev_status == (uint8_t)GameStatus::GAME_IDLE) {
+                  for (const auto &it : emu_rpcs3)
+                    if (it.name == game_status_name) {
+                      status_toast =
+                          "RPCS3: Configuration > Advanced > Exclusive "
+                          "Fullscreen Mode > Prefer borderless fullscreen";
+                      toast_since = std::chrono::steady_clock::now();
+                      toast_ms = 10000;
+                      break;
+                    }
                 }
               }
             }
@@ -874,6 +903,10 @@ hud_frames++;
   if (audio_stream)
     SDL_DestroyAudioStream(audio_stream);
 
+  if (peer) {
+    enet_peer_disconnect(peer, 0);
+    enet_host_flush(client);
+  }
   enet_host_destroy(client);
   enet_deinitialize();
 }

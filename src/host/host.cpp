@@ -148,24 +148,35 @@ void start_host_server(int port, bool &running, bool debug_audio,
   ProcessManager process_manager;
 
   // Optional analog gamepad via HIDMaestro bridge (opt-in: [input] analog=true).
-  // Initialized on a background thread: the UAC prompt / driver setup can take
-  // tens of seconds, and blocking here would leave clients unable to connect
-  // until it finished. The pointer is published atomically when ready; input
-  // falls back to the digital mapper until then.
-  std::atomic<HidMaestroInjector *> analog{nullptr};
+  // Initialized synchronously BEFORE the serve loop: the bridge's UAC prompt
+  // and virtual-device PnP setup steal focus, so it must finish before the
+  // client can connect or launch a game. The client retries its connection
+  // until the host starts serving, so this does not break connectivity.
+  std::unique_ptr<HidMaestroInjector> analog;
   if (game_config.analog_input) {
-    std::thread([&]() {
-      auto *inj = new HidMaestroInjector();
-      if (inj->init()) {
-        std::cout << "[Host] Analog controller injection enabled (HIDMaestro)\n";
-        analog.store(inj);
-      } else {
-        delete inj;
-        std::cout << "[Host] Analog injection unavailable; using digital "
-                     "key-mapping\n";
-      }
-    }).detach();
+    analog = std::make_unique<HidMaestroInjector>();
+    if (analog->init()) {
+      std::cout << "[Host] Analog controller injection enabled (HIDMaestro)\n";
+    } else {
+      analog.reset();
+      std::cout << "[Host] Analog injection unavailable; using digital "
+                   "key-mapping\n";
+    }
   }
+
+  // Keyboard events and digital gamepad mapping both inject global SendInput
+  // state. Release it on every lifecycle boundary so dropped key-up/focus
+  // events cannot leave modifiers or buttons latched in the host desktop.
+  auto release_input_state = [&]() {
+    if (injector)
+      injector->releaseAll();
+    mapper.reset();
+    if (analog) {
+      InputPacket neutral = {};
+      neutral.timestamp_us = get_timestamp_us();
+      analog->sendGamepadState(neutral);
+    }
+  };
 
   // Send a control message (FrameHeader{CONTROL} + control_type + payload)
   auto send_control = [&](ENetPeer *peer, ControlType type, const void *payload,
@@ -211,6 +222,8 @@ void start_host_server(int port, bool &running, bool debug_audio,
 
   auto frame_duration = std::chrono::microseconds(1000000 / enc_settings.fps);
   auto last_frame_time = std::chrono::steady_clock::now();
+  ULONGLONG last_focus_tick = 0;
+  bool focus_done = false;
 
   // Dedicated audio thread: capture + encode run independently of the video
   // path so video encode spikes cannot starve audio capture (was causing
@@ -326,9 +339,9 @@ void start_host_server(int port, bool &running, bool debug_audio,
         }
         const FrameHeader *hdr =
             reinterpret_cast<const FrameHeader *>(event.packet->data);
-        // Input on channel 3 (gamepad unreliable, keyboard reliable), kept off
-        // the control channel so input pressure can't throttle video/audio or
-        // delay control messages.
+        // Gamepad frames on channel 3 (unreliable, latest state wins). Keyboard is
+        // reliable on channel 0: reliable + unreliable must not share a channel,
+        // or a dropped gamepad frame stalls key delivery.
         if (event.channelID == 3) {
           if (hdr->type == (uint8_t)PacketType::INPUT_EVENT &&
               event.packet->dataLength >=
@@ -336,27 +349,36 @@ void start_host_server(int port, bool &running, bool debug_audio,
             InputPacket ip;
             memcpy(&ip, event.packet->data + sizeof(FrameHeader),
                    sizeof(InputPacket));
-            HidMaestroInjector *ana = analog.load();
-            if (ana && ana->sendGamepadState(ip)) {
+            // Diagnostic: confirm gamepad frames reach the host and which path
+            // handles them (analog bridge vs digital key-map).
+            static uint32_t input_diag = 0;
+            if (++input_diag % 125 == 0) {
+              std::cout << "[Host] input buttons=0x" << std::hex << ip.buttons
+                        << std::dec << " analog=" << (analog ? 1 : 0) << " lx="
+                        << ip.left_stick_x << " rx=" << ip.right_stick_x
+                        << "\n";
+            }
+            if (analog && analog->sendGamepadState(ip)) {
               // analog injection handled
             } else if (injector) {
               mapper.processGamepad(ip, [&](uint32_t vk, bool down) {
                 injector->sendKey(vk, down);
               });
             }
-          } else if (hdr->type == (uint8_t)PacketType::KEYBOARD_EVENT &&
-                     event.packet->dataLength >=
-                         sizeof(FrameHeader) + sizeof(KeyPacket)) {
+          }
+        }
+        else if (event.channelID == 0) {
+          if (hdr->type == (uint8_t)PacketType::KEYBOARD_EVENT &&
+              event.packet->dataLength >=
+                  sizeof(FrameHeader) + sizeof(KeyPacket)) {
             KeyPacket kp;
             memcpy(&kp, event.packet->data + sizeof(FrameHeader),
                    sizeof(KeyPacket));
             uint32_t vk = sdlk_to_vk((SDL_Keycode)kp.key);
             if (injector && vk != 0)
               injector->sendKey(vk, kp.down != 0);
-          }
-        } else if (event.channelID == 0 &&
-                   hdr->type == (uint8_t)PacketType::CONTROL &&
-                   event.packet->dataLength >= sizeof(FrameHeader) + 1) {
+          } else if (hdr->type == (uint8_t)PacketType::CONTROL &&
+                     event.packet->dataLength >= sizeof(FrameHeader) + 1) {
             uint8_t ctype = event.packet->data[sizeof(FrameHeader)];
             const uint8_t *payload =
                 event.packet->data + sizeof(FrameHeader) + 1;
@@ -396,6 +418,7 @@ void start_host_server(int port, bool &running, bool debug_audio,
               send_game_status(event.peer);
               if (process_manager.launch(game_config, index)) {
                 game_status = (uint8_t)GameStatus::GAME_RUNNING;
+                focus_done = false;
               } else {
                 game_status = (uint8_t)GameStatus::GAME_LAUNCH_FAILED;
                 game_status_reason = "launch failed";
@@ -407,6 +430,7 @@ void start_host_server(int port, bool &running, bool debug_audio,
               break;
             }
           }
+          }
         enet_packet_destroy(event.packet);
         break;
       }
@@ -415,7 +439,10 @@ void start_host_server(int port, bool &running, bool debug_audio,
         std::cout << "[Host] Client disconnected\n";
         client_peer.store(nullptr);
         streaming = false;
-        mapper.reset();
+        release_input_state();
+        // Free the single peer slot right away so a reconnecting client isn't
+        // rejected while this peer lingers in the disconnected state.
+        enet_peer_reset(event.peer);
         break;
 
       default:
@@ -430,8 +457,20 @@ void start_host_server(int port, bool &running, bool debug_audio,
       game_status = (uint8_t)GameStatus::GAME_IDLE;
       current_game.clear();
       game_status_reason.clear();
+      release_input_state();
       if (ENetPeer *p = client_peer.load())
         send_game_status(p);
+    }
+
+    // Focus the game window once after launch (bounded retry until it takes
+    // foreground), then stop. Re-asserting focus continuously interferes with
+    // the game's own keyboard handling (Esc / Alt+Enter fullscreen toggle).
+    if (game_status == (uint8_t)GameStatus::GAME_RUNNING && !focus_done &&
+        GetTickCount64() - last_focus_tick >= 500) {
+      last_focus_tick = GetTickCount64();
+      process_manager.ensureForeground();
+      if (process_manager.isForeground())
+        focus_done = true;
     }
 
     ENetPeer *peer = client_peer.load();
@@ -502,6 +541,7 @@ void start_host_server(int port, bool &running, bool debug_audio,
   }
 
   std::cout << "[Host] Streaming stopped\n";
+  release_input_state();
   if (audio_worker.joinable())
     audio_worker.join();
   if (capture)

@@ -13,7 +13,10 @@ bool SendInputInjector::init() {
   return true;
 }
 
-void SendInputInjector::shutdown() { m_initialized = false; }
+void SendInputInjector::shutdown() {
+  releaseAll();
+  m_initialized = false;
+}
 
 void SendInputInjector::sendKey(uint32_t vk, bool down) {
   if (!m_initialized || vk == 0)
@@ -24,7 +27,23 @@ void SendInputInjector::sendKey(uint32_t vk, bool down) {
   input.ki.wVk = static_cast<WORD>(vk);
   input.ki.wScan = 0;
   input.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
-  SendInput(1, &input, sizeof(INPUT));
+  if (SendInput(1, &input, sizeof(INPUT)) == 1 && vk < m_pressed.size())
+    m_pressed[vk] = down;
+}
+
+void SendInputInjector::releaseAll() {
+  if (!m_initialized)
+    return;
+  for (uint32_t vk = 1; vk < m_pressed.size(); ++vk) {
+    if (!m_pressed[vk])
+      continue;
+    INPUT input = {};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = static_cast<WORD>(vk);
+    input.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &input, sizeof(INPUT));
+    m_pressed[vk] = false;
+  }
 }
 
 bool SendInputInjector::sendGamepadState(const InputPacket &state) {

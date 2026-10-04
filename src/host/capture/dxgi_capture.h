@@ -30,6 +30,11 @@ private:
     bool initDXGI();
     bool createStagingTexture();
     bool reinitDXGI();
+    bool reinitAll();
+    bool queryOutput0(int &w, int &h, int &left, int &top);
+    bool initGdi();
+    void releaseGdi();
+    bool gdiAcquire(CapturedFrame& frame);
 
     ComPtr<ID3D11Device> m_device;
     ComPtr<ID3D11DeviceContext> m_context;
@@ -44,6 +49,21 @@ private:
     CaptureError m_lastError = CaptureError::None;
     D3D11_MAPPED_SUBRESOURCE m_mappedResource = {};
     ULONGLONG m_lastReinitTick = 0;
+    // GDI fallback state (Desktop Duplication is unstable on some Win11/NVIDIA
+    // setups and can loop on DXGI_ERROR_ACCESS_LOST forever).
+    bool m_gdiMode = false;
+    ULONGLONG m_lastGoodTick = 0;
+    ULONGLONG m_failStartTick = 0;
+    HDC m_gdiScreen = nullptr;
+    HDC m_gdiMem = nullptr;
+    HBITMAP m_gdiBmp = nullptr;
+    HGDIOBJ m_gdiOldBitmap = nullptr;
+    uint8_t *m_gdiBits = nullptr;
+    int m_gdiWidth = 0;
+    int m_gdiHeight = 0;
+    int m_outputLeft = 0;
+    int m_outputTop = 0;
+    bool m_gdiFirstFrameLogged = false;
 };
 
 } // namespace rps

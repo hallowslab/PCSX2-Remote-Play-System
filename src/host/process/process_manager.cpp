@@ -30,7 +30,10 @@ BOOL CALLBACK find_emu_window(HWND hwnd, LPARAM lparam) {
 }
 } // namespace
 
-ProcessManager::~ProcessManager() { close(); }
+// Deliberately no close() in the destructor: the host must never tear down a
+// running emulator when it exits (would risk save-data corruption). The OS
+// cleans up the process handle; the emulator keeps running.
+ProcessManager::~ProcessManager() = default;
 
 bool ProcessManager::launch(const GameConfig &config, size_t game_index) {
   if (game_index >= config.games.size()) {
@@ -53,7 +56,13 @@ bool ProcessManager::launch(const GameConfig &config, size_t game_index) {
     // -batch: run headless and exit the emulator when the game closes.
     cmdline << "-batch -fullscreen -- \"" << g.boot_path << "\"";
   } else {
-    cmdline << "--no-gui --fullscreen \"" << g.boot_path << "\"";
+    // RPCS3 --no-gui hides the main window and shows only the game view. Its
+    // Vulkan/D3D12 renderer must use borderless fullscreen (user setting) so
+    // Desktop Duplication / GDI capture sees the game instead of black.
+    cmdline << "--no-gui \"" << g.boot_path << "\"";
+    std::cout
+        << "[Process] RPCS3: for a stable stream, set Configuration > Advanced "
+           "> Exclusive Fullscreen Mode > Prefer borderless fullscreen.\n";
   }
   if (!g.args.empty())
     cmdline << " " << g.args;
@@ -80,7 +89,38 @@ bool ProcessManager::launch(const GameConfig &config, size_t game_index) {
   }
   CloseHandle(pi.hThread);
   m_process = pi.hProcess;
+  m_hwnd = nullptr;
   return true;
+#else
+  return false;
+#endif
+}
+
+void ProcessManager::ensureForeground() {
+#ifdef _WIN32
+  if (!m_process)
+    return;
+  if (m_hwnd && !IsWindow(m_hwnd))
+    m_hwnd = nullptr;
+  if (!m_hwnd) {
+    EnumCtx ctx{GetProcessId(m_process), nullptr};
+    EnumWindows(find_emu_window, reinterpret_cast<LPARAM>(&ctx));
+    if (!ctx.hwnd)
+      return; // game window not up yet
+    m_hwnd = ctx.hwnd;
+  }
+  if (GetForegroundWindow() == m_hwnd)
+    return;
+  // Plain SetForegroundWindow: we just spawned this process, so Windows grants
+  // it the right to become foreground. Do NOT AttachThreadInput — attaching our
+  // input queue to the game's breaks its Esc / Alt+Enter handling.
+  SetForegroundWindow(m_hwnd);
+#endif
+}
+
+bool ProcessManager::isForeground() const {
+#ifdef _WIN32
+  return m_hwnd && GetForegroundWindow() == m_hwnd;
 #else
   return false;
 #endif
@@ -101,6 +141,7 @@ void ProcessManager::close() {
   if (wait == WAIT_OBJECT_0) {
     CloseHandle(m_process);
     m_process = nullptr;
+    m_hwnd = nullptr;
     std::cout << "[Process] Emulator closed gracefully\n";
     return;
   }
@@ -109,6 +150,7 @@ void ProcessManager::close() {
   WaitForSingleObject(m_process, 1000);
   CloseHandle(m_process);
   m_process = nullptr;
+  m_hwnd = nullptr;
   std::cout << "[Process] Emulator terminated\n";
 #else
   (void)0;

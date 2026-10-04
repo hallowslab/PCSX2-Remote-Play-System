@@ -173,7 +173,14 @@ bool HidMaestroInjector::sendGamepadState(const InputPacket &state) {
     return false;
   DWORD written = 0;
   BOOL ok = WriteFile(m_pipe, &state, sizeof(InputPacket), &written, nullptr);
-  return ok && written == sizeof(InputPacket);
+  if (!ok || written != sizeof(InputPacket)) {
+    static DWORD fail_count = 0;
+    if (++fail_count % 125 == 1)
+      std::cerr << "[HidMaestro] analog write failed (err " << GetLastError()
+                << ")\n";
+    return false;
+  }
+  return true;
 }
 
 } // namespace rps

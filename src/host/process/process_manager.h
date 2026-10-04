@@ -23,11 +23,20 @@ public:
   // Terminate the running emulator process, if any.
   void close();
 
+  // Find the emulator's game window (once) and keep it foreground. Called
+  // periodically while a game runs so the host terminal / other windows don't
+  // steal focus from the streamed game.
+  void ensureForeground();
+
+  // True when the emulator's game window currently owns the foreground.
+  bool isForeground() const;
+
   bool isRunning() const;
 
 private:
 #ifdef _WIN32
   HANDLE m_process = nullptr;
+  HWND m_hwnd = nullptr;
 #endif
 };
 
